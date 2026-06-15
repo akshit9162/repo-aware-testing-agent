@@ -31,6 +31,14 @@ Choose an output plan path:
 node src/cli.js /path/to/repo --plan qa-plan.json
 ```
 
+Generate an Excel-compatible Playwright report workbook:
+
+```sh
+node src/cli.js coverage-excel /path/to/playwright-report/results.json --out playwright-coverage.xls
+```
+
+The workbook includes a Summary sheet and a Tests sheet with project, file, test title, status, duration, retries, and errors.
+
 ## Generated Scripts
 
 Depending on the repo, the agent can add:
@@ -58,4 +66,3 @@ Generated tests are intentionally configurable through environment variables suc
 - `QA_SMOKE_PATH`
 - `QA_API_BASE_URL`
 - `QA_K6_URL`
-

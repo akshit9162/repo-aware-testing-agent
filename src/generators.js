@@ -4,7 +4,7 @@ export default defineConfig({
   testDir: './tests',
   timeout: 60_000,
   retries: process.env.CI ? 1 : 0,
-  reporter: [['list'], ['html', { open: 'never' }]],
+  reporter: [['list'], ['html', { open: 'never' }], ['json', { outputFile: 'playwright-report/results.json' }]],
   use: {
     baseURL: process.env.QA_BASE_URL || 'http://localhost:3000',
     trace: 'retain-on-failure',
