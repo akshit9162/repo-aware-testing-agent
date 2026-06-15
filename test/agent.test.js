@@ -10,6 +10,8 @@ import {
   createTestPlan,
   generateAssets,
   applyAssets,
+  createSonarProperties,
+  discoverApiEndpoints,
   discoverUserJourneys,
   discoverUnitTestTargets,
   summarizePlaywrightReport,
@@ -31,6 +33,8 @@ async function makeFixture() {
   await fs.writeFile(path.join(dir, "src", "PriceCard.tsx"), "export function PriceCard(){ return <article/> }");
   await fs.mkdir(path.join(dir, "pages", "api"), { recursive: true });
   await fs.writeFile(path.join(dir, "pages", "api", "health.ts"), "export default function handler(){}");
+  await fs.mkdir(path.join(dir, "app", "api", "orders", "[id]"), { recursive: true });
+  await fs.writeFile(path.join(dir, "app", "api", "orders", "[id]", "route.ts"), "export function GET(){}");
   await fs.mkdir(path.join(dir, "app", "checkout"), { recursive: true });
   await fs.mkdir(path.join(dir, "app", "products", "[id]"), { recursive: true });
   await fs.writeFile(path.join(dir, "app", "page.tsx"), "export default function Page(){ return <main/> }");
@@ -60,9 +64,44 @@ test("scans repo and generates customized QA assets", async () => {
   assert.equal(unitSpec.content.includes("src/PriceCard.tsx"), true);
   assert.equal(unitSpec.content.includes("pages/api/health.ts"), true);
   assert.equal(unitSpec.content.includes(".env.example"), true);
+  const postman = assets.files.find((file) => file.path === "postman/qa-collection.json");
+  assert.equal(postman.content.includes("GET /api/health"), true);
+  assert.equal(postman.content.includes("GET /api/orders/sample"), true);
+  const sonar = assets.files.find((file) => file.path === "sonar-project.properties");
+  assert.match(sonar.content, /sonar.sources=app,pages,src/);
+  assert.match(sonar.content, /sonar.javascript.lcov.reportPaths=coverage\/lcov.info/);
   const journeySpec = assets.files.find((file) => file.path === "tests/e2e/user-journeys.spec.ts");
   assert.match(journeySpec.content, /"title": "checkout"/);
   assert.match(journeySpec.content, /QA_ROUTE_PRODUCTS_PARAM/);
+});
+
+test("discovers API endpoints from scanned route files", async () => {
+  const endpoints = discoverApiEndpoints([
+    "pages/api/health.ts",
+    "pages/api/products/[id].ts",
+    "app/api/orders/[id]/route.ts",
+    "src/routes/admin/users.ts",
+  ]);
+
+  assert.deepEqual(endpoints.map((endpoint) => endpoint.path), [
+    "/api/health",
+    "/api/orders/sample",
+    "/api/products/sample",
+    "/routes/admin/users",
+  ]);
+  assert.equal(endpoints.find((endpoint) => endpoint.path === "/api/orders/sample").env, "QA_API_API_ORDERS_SAMPLE");
+});
+
+test("creates repo-aware SonarQube properties", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const properties = createSonarProperties(scan);
+
+  assert.match(properties, /sonar.projectKey=/);
+  assert.match(properties, /sonar.sources=app,pages,src/);
+  assert.match(properties, /sonar.tests=tests/);
+  assert.match(properties, /sonar.exclusions=.*node_modules/);
+  assert.match(properties, /sonar.coverage.exclusions=/);
 });
 
 test("discovers unit test targets from scanned repo files", async () => {

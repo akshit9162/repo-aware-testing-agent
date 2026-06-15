@@ -1,5 +1,7 @@
 import { discoverUserJourneys } from "./journeys.js";
 import { discoverUnitTestTargets } from "./unitDiscovery.js";
+import { discoverApiEndpoints } from "./apiDiscovery.js";
+import { createSonarProperties } from "./sonarDiscovery.js";
 
 const PLAYWRIGHT_CONFIG = `import { defineConfig, devices } from '@playwright/test';
 
@@ -153,50 +155,55 @@ describe('QA generated unit coverage manifest', () => {
 `;
 }
 
-const SONAR = `sonar.projectKey=repo-aware-qa
-sonar.projectName=Repo Aware QA
-sonar.sources=src
-sonar.tests=tests
-sonar.javascript.lcov.reportPaths=coverage/lcov.info
-`;
-
-const POSTMAN = `{
-  "info": {
-    "name": "QA API Contract",
-    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
-  },
-  "item": [
-    {
-      "name": "Health check",
-      "request": {
-        "method": "GET",
-        "url": "{{baseUrl}}/health"
+function createPostmanCollection(endpoints) {
+  const item = endpoints.map((endpoint) => ({
+    name: `${endpoint.method} ${endpoint.path}`,
+    request: {
+      method: endpoint.method,
+      url: `{{baseUrl}}{{${endpoint.env}}}`,
+      description: `Generated from ${endpoint.source}. Validates ${endpoint.name}.`,
+    },
+    event: [
+      {
+        listen: "test",
+        script: {
+          type: "text/javascript",
+          exec: [
+            `pm.test('${endpoint.method} ${endpoint.path} does not return server error', function () {`,
+            "  pm.expect(pm.response.code).to.be.below(500);",
+            "});",
+            `pm.test('${endpoint.method} ${endpoint.path} responds within 2s', function () {`,
+            "  pm.expect(pm.response.responseTime).to.be.below(2000);",
+            "});",
+            "if ((pm.response.headers.get('content-type') || '').includes('application/json')) {",
+            `  pm.test('${endpoint.method} ${endpoint.path} returns valid JSON when advertised', function () {`,
+            "    pm.response.json();",
+            "  });",
+            "}",
+          ],
+        },
       },
-      "event": [
-        {
-          "listen": "test",
-          "script": {
-            "type": "text/javascript",
-            "exec": [
-              "pm.test('status is not server error', function () {",
-              "  pm.expect(pm.response.code).to.be.below(500);",
-              "});"
-            ]
-          }
-        }
-      ]
-    }
-  ]
-}
-`;
+    ],
+  }));
 
-const POSTMAN_ENV = `{
-  "name": "QA Local",
-  "values": [
-    { "key": "baseUrl", "value": "http://localhost:3000", "enabled": true }
-  ]
+  return `${JSON.stringify({
+    info: {
+      name: "QA API Contract",
+      schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    },
+    item,
+  }, null, 2)}\n`;
 }
-`;
+
+function createPostmanEnv(endpoints) {
+  return `${JSON.stringify({
+    name: "QA Local",
+    values: [
+      { key: "baseUrl", value: "http://localhost:3000", enabled: true },
+      ...endpoints.map((endpoint) => ({ key: endpoint.env, value: endpoint.path, enabled: true })),
+    ],
+  }, null, 2)}\n`;
+}
 
 const K6 = `import http from 'k6/http';
 import { check, sleep } from 'k6';
@@ -489,14 +496,15 @@ export function generateAssets(scan, plan) {
   files.push({ path: "tests/unit/qa-generated-regression.test.js", content: createGeneratedUnitTests(discoverUnitTestTargets(scan)) });
 
   addScript(pkg.scripts, "qa:quality", "sonar-scanner");
-  files.push({ path: "sonar-project.properties", content: SONAR });
+  files.push({ path: "sonar-project.properties", content: createSonarProperties(scan) });
 
   if (plan.stack.hasApi) {
+    const endpoints = discoverApiEndpoints(scan.files);
     addScript(pkg.scripts, "qa:api", "npm run qa:prepare && newman run postman/qa-collection.json -e postman/qa-env.json --reporters cli,json --reporter-json-export qa-results/newman.json");
     addScript(pkg.scripts, "qa:perf", "npm run qa:prepare && k6 run --summary-export qa-results/k6-summary.json tests/performance/load.js");
     addDevDependency(deps, "newman", "^6.2.1");
-    files.push({ path: "postman/qa-collection.json", content: POSTMAN });
-    files.push({ path: "postman/qa-env.json", content: POSTMAN_ENV });
+    files.push({ path: "postman/qa-collection.json", content: createPostmanCollection(endpoints) });
+    files.push({ path: "postman/qa-env.json", content: createPostmanEnv(endpoints) });
     files.push({ path: "tests/performance/load.js", content: K6 });
   }
 

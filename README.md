@@ -13,6 +13,8 @@ It inspects the target repo, builds a risk-aware test plan, then optionally writ
 
 Unit tests are generated from the repo scan. The agent creates a baseline Vitest harness plus a repo-specific regression manifest that checks detected package scripts, source files, UI routes, API files, component files, config files, and environment contract files.
 
+API tests are generated from detected API route files such as `pages/api/**`, `app/api/**/route.ts`, and `src/routes/**`. The Postman collection validates server-error status, response time, and JSON parseability when JSON is advertised. SonarQube configuration is generated from detected source/test folders with LCOV coverage and common build/report exclusions.
+
 ## Usage
 
 Preview a plan without writing files:
