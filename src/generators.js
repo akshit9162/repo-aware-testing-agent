@@ -257,21 +257,53 @@ function playwrightStatus(test) {
   return results.at(-1)?.status || 'unknown';
 }
 
-function flattenPlaywrightSuite(suite, rows = []) {
+function describePlaywrightCase(title, file) {
+  const normalized = title.toLowerCase();
+  if (normalized.includes('smoke')) return 'Checks that the configured smoke page loads and renders page content.';
+  if (normalized.includes('journey:')) return 'Checks a discovered user journey route renders and visible form controls can be safely exercised.';
+  if (normalized.includes('critical journey')) return 'Checks the configured critical end-to-end journey page renders successfully.';
+  return 'Checks Playwright browser behavior for ' + title + (file ? ' in ' + file : '') + '.';
+}
+
+function flattenPlaywrightSuite(suite, rows = [], parentTitles = []) {
+  const suiteTitles = [...parentTitles, suite.title].filter(Boolean);
   for (const spec of suite.specs || []) {
-    for (const test of spec.tests || []) rows.push(playwrightStatus(test));
+    for (const test of spec.tests || []) {
+      const results = test.results || [];
+      const title = [...suiteTitles, spec.title].filter(Boolean).join(' > ');
+      const status = playwrightStatus(test);
+      const durationMs = results.reduce((sum, result) => sum + (result.duration || 0), 0);
+      const errors = results
+        .flatMap((result) => result.errors || [])
+        .map((error) => error.message || error.value || '')
+        .filter(Boolean)
+        .join('\\n');
+      rows.push({
+        tool: 'playwright',
+        suite: suiteTitles.join(' > '),
+        file: spec.file || '',
+        project: test.projectName || '',
+        title,
+        description: describePlaywrightCase(title, spec.file || ''),
+        status,
+        durationMs,
+        retries: Math.max(0, results.length - 1),
+        errors,
+      });
+    }
   }
-  for (const child of suite.suites || []) flattenPlaywrightSuite(child, rows);
+  for (const child of suite.suites || []) flattenPlaywrightSuite(child, rows, suiteTitles);
   return rows;
 }
 
-function addPlaywright(report, rows) {
+function addPlaywright(report, rows, testCases) {
   if (!report) return;
-  const statuses = (report.suites || []).flatMap((suite) => flattenPlaywrightSuite(suite));
-  const passed = statuses.filter((status) => status === 'passed').length;
-  const failed = statuses.filter((status) => status === 'failed').length;
-  const skipped = statuses.filter((status) => status === 'skipped').length;
-  rows.push({ tool: 'playwright', status: failed ? 'failed' : 'passed', total: statuses.length, passed, failed, skipped, coverage: '', source: 'playwright-report/results.json' });
+  const cases = (report.suites || []).flatMap((suite) => flattenPlaywrightSuite(suite));
+  testCases.push(...cases);
+  const passed = cases.filter((test) => test.status === 'passed').length;
+  const failed = cases.filter((test) => test.status === 'failed').length;
+  const skipped = cases.filter((test) => test.status === 'skipped').length;
+  rows.push({ tool: 'playwright', status: failed ? 'failed' : 'passed', total: cases.length, passed, failed, skipped, coverage: '', source: 'playwright-report/results.json' });
 }
 
 function addVitest(report, rows) {
@@ -313,7 +345,8 @@ function addGrype(report, rows) {
 }
 
 const rows = [];
-addPlaywright(readJson('playwright-report/results.json'), rows);
+const testCases = [];
+addPlaywright(readJson('playwright-report/results.json'), rows, testCases);
 addVitest(readJson('qa-results/vitest.json'), rows);
 addNewman(readJson('qa-results/newman.json'), rows);
 addK6(readJson('qa-results/k6-summary.json'), rows);
@@ -333,7 +366,7 @@ const summary = rows.reduce((acc, item) => {
   return acc;
 }, { status: 'passed', total: 0, passed: 0, failed: 0, skipped: 0 });
 
-const report = { generatedAt: new Date().toISOString(), summary, rows };
+const report = { generatedAt: new Date().toISOString(), summary, rows, testCases };
 writeFileSync(path.join(outDir, 'qa-report.json'), JSON.stringify(report, null, 2) + '\\n');
 
 const workbook = '<?xml version="1.0"?>\\n<?mso-application progid="Excel.Sheet"?>\\n<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">' +
@@ -349,6 +382,10 @@ const workbook = '<?xml version="1.0"?>\\n<?mso-application progid="Excel.Sheet"
   worksheet('Tools', [
     row(['Tool', 'Status', 'Total', 'Passed', 'Failed', 'Skipped', 'Coverage', 'Source']),
     ...rows.map((item) => row([item.tool, item.status, item.total, item.passed, item.failed, item.skipped, item.coverage, item.source])),
+  ]) +
+  worksheet('Test Cases', [
+    row(['Tool', 'Suite', 'File', 'Project', 'Test Case', 'Description', 'Status', 'Duration ms', 'Retries', 'Errors']),
+    ...testCases.map((item) => row([item.tool, item.suite, item.file, item.project, item.title, item.description, item.status, item.durationMs, item.retries, item.errors])),
   ]) +
   '</Workbook>\\n';
 writeFileSync(path.join(outDir, 'qa-report.xls'), workbook);

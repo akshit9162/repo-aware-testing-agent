@@ -63,7 +63,7 @@ Depending on the repo, the agent can add:
 - `qa-results/qa-report.json`
 - `qa-results/qa-report.xls`
 
-The consolidated report summarizes available Vitest, Playwright, Postman/Newman, Grype, k6, and LCOV coverage artifacts.
+The consolidated report summarizes available Vitest, Playwright, Postman/Newman, Grype, k6, and LCOV coverage artifacts. For Playwright, it also includes individual test-case descriptions, pass/fail status, file/project, duration, retries, and errors in the JSON report and the Excel `Test Cases` sheet.
 
 ## Philosophy
 

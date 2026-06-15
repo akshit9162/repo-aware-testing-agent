@@ -140,7 +140,21 @@ test("generated QA reporter summarizes all available artifacts", async () => {
   await fs.mkdir(path.join(dir, "qa-results"), { recursive: true });
   await fs.mkdir(path.join(dir, "coverage"), { recursive: true });
   await fs.writeFile(path.join(dir, "playwright-report", "results.json"), JSON.stringify({
-    suites: [{ specs: [{ tests: [{ results: [{ status: "passed" }] }] }] }],
+    suites: [{
+      title: "e2e",
+      specs: [
+        {
+          title: "journey: checkout",
+          file: "tests/e2e/user-journeys.spec.ts",
+          tests: [{ projectName: "chromium", results: [{ status: "passed", duration: 100 }] }],
+        },
+        {
+          title: "smoke: configured page loads",
+          file: "tests/smoke/qa-smoke.spec.ts",
+          tests: [{ projectName: "chromium", results: [{ status: "failed", duration: 50, errors: [{ message: "body is empty" }] }] }],
+        },
+      ],
+    }],
   }), "utf8");
   await fs.writeFile(path.join(dir, "qa-results", "vitest.json"), JSON.stringify({
     numTotalTests: 2,
@@ -162,8 +176,16 @@ test("generated QA reporter summarizes all available artifacts", async () => {
   const report = JSON.parse(await fs.readFile(path.join(dir, "qa-results", "qa-report.json"), "utf8"));
   const workbook = await fs.readFile(path.join(dir, "qa-results", "qa-report.xls"), "utf8");
 
-  assert.equal(report.summary.total, 10);
-  assert.equal(report.summary.failed, 1);
+  assert.equal(report.summary.total, 11);
+  assert.equal(report.summary.failed, 2);
+  assert.equal(report.testCases.length, 2);
+  assert.equal(report.testCases[0].title, "e2e > journey: checkout");
+  assert.equal(report.testCases[0].status, "passed");
+  assert.match(report.testCases[0].description, /discovered user journey/);
+  assert.equal(report.testCases[1].status, "failed");
+  assert.match(report.testCases[1].errors, /body is empty/);
   assert.equal(report.rows.some((row) => row.tool === "coverage" && row.coverage.includes("lines 80%")), true);
   assert.match(workbook, /<Worksheet ss:Name="Tools">/);
+  assert.match(workbook, /<Worksheet ss:Name="Test Cases">/);
+  assert.match(workbook, /Checks that the configured smoke page loads/);
 });
