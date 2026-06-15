@@ -15,6 +15,8 @@ Unit tests are generated from the repo scan. The agent creates a baseline Vitest
 
 API tests are generated from detected API route files such as `pages/api/**`, `app/api/**/route.ts`, and `src/routes/**`. The Postman collection validates server-error status, response time, and JSON parseability when JSON is advertised. SonarQube configuration is generated from detected source/test folders with LCOV coverage and common build/report exclusions.
 
+Security and performance checks are also generated from the scan. The agent writes `.grype.yaml` and a `qa:security` script that fails on high/critical vulnerabilities while exporting `qa-results/grype.json`. For API repos, it generates a k6 script that load-tests each discovered endpoint with response-time and success-rate thresholds.
+
 ## Usage
 
 Preview a plan without writing files:

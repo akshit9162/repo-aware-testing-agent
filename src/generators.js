@@ -2,6 +2,7 @@ import { discoverUserJourneys } from "./journeys.js";
 import { discoverUnitTestTargets } from "./unitDiscovery.js";
 import { discoverApiEndpoints } from "./apiDiscovery.js";
 import { createSonarProperties } from "./sonarDiscovery.js";
+import { createGrypeConfig } from "./securityDiscovery.js";
 
 const PLAYWRIGHT_CONFIG = `import { defineConfig, devices } from '@playwright/test';
 
@@ -205,25 +206,48 @@ function createPostmanEnv(endpoints) {
   }, null, 2)}\n`;
 }
 
-const K6 = `import http from 'k6/http';
+function createK6Script(endpoints) {
+  const targets = endpoints.map((endpoint) => ({
+    name: endpoint.name,
+    method: endpoint.method,
+    path: endpoint.path,
+    env: endpoint.env,
+    source: endpoint.source,
+  }));
+
+  return `import http from 'k6/http';
 import { check, sleep } from 'k6';
+import { group } from 'k6';
 
 export const options = {
   vus: Number(__ENV.QA_K6_VUS || 5),
   duration: __ENV.QA_K6_DURATION || '30s',
   thresholds: {
     http_req_failed: ['rate<0.05'],
-    http_req_duration: ['p(95)<1000']
+    http_req_duration: ['p(95)<1000'],
+    checks: ['rate>0.95']
   }
 };
 
+const endpoints = ${JSON.stringify(targets, null, 2)};
+
 export default function () {
-  const url = __ENV.QA_K6_URL || 'http://localhost:3000/health';
-  const res = http.get(url);
-  check(res, { 'status is below 500': (r) => r.status < 500 });
+  const baseUrl = __ENV.QA_K6_BASE_URL || __ENV.QA_API_BASE_URL || 'http://localhost:3000';
+  for (const endpoint of endpoints) {
+    const path = __ENV[endpoint.env] || endpoint.path;
+    const url = baseUrl.replace(/\\/$/, '') + path;
+    group(endpoint.method + ' ' + path, () => {
+      const res = http.request(endpoint.method, url);
+      check(res, {
+        'status is below 500': (r) => r.status < 500,
+        'response completed under 1s': (r) => r.timings.duration < 1000,
+      });
+    });
+  }
   sleep(1);
 }
 `;
+}
 
 function createQaRunAll(order) {
   return `import { spawnSync } from 'node:child_process';
@@ -505,16 +529,17 @@ export function generateAssets(scan, plan) {
     addDevDependency(deps, "newman", "^6.2.1");
     files.push({ path: "postman/qa-collection.json", content: createPostmanCollection(endpoints) });
     files.push({ path: "postman/qa-env.json", content: createPostmanEnv(endpoints) });
-    files.push({ path: "tests/performance/load.js", content: K6 });
+    files.push({ path: "tests/performance/load.js", content: createK6Script(endpoints) });
   }
 
-  addScript(pkg.scripts, "qa:security", "npm run qa:prepare && grype . -o json > qa-results/grype.json");
+  addScript(pkg.scripts, "qa:security", "npm run qa:prepare && grype . -o json --fail-on high > qa-results/grype.json");
   addScript(pkg.scripts, "qa:report", "node scripts/qa-report.mjs");
 
   if (qaOrder.some((script) => pkg.scripts[script])) addScript(pkg.scripts, "qa:all", "node scripts/qa-run-all.mjs");
 
   files.push({ path: "scripts/qa-run-all.mjs", content: createQaRunAll(qaOrder) });
   files.push({ path: "scripts/qa-report.mjs", content: QA_REPORT });
+  files.push({ path: ".grype.yaml", content: createGrypeConfig(scan) });
   files.push({ path: "qa-plan.json", content: `${JSON.stringify(plan, null, 2)}\n` });
 
   return {

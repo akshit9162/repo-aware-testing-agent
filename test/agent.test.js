@@ -11,7 +11,9 @@ import {
   generateAssets,
   applyAssets,
   createSonarProperties,
+  createGrypeConfig,
   discoverApiEndpoints,
+  discoverSecurityTargets,
   discoverUserJourneys,
   discoverUnitTestTargets,
   summarizePlaywrightReport,
@@ -27,6 +29,8 @@ async function makeFixture() {
     dependencies: { next: "^15.0.0", react: "^18.3.1" },
     devDependencies: { vite: "^7.0.0" }
   }, null, 2));
+  await fs.writeFile(path.join(dir, "package-lock.json"), "{}");
+  await fs.writeFile(path.join(dir, "Dockerfile"), "FROM node:22-alpine\n");
   await fs.writeFile(path.join(dir, "vite.config.ts"), "export default {}");
   await fs.writeFile(path.join(dir, ".env.example"), "NEXT_PUBLIC_API_URL=http://localhost:3000\n");
   await fs.writeFile(path.join(dir, "src", "App.tsx"), "export function App(){ return <div/> }");
@@ -70,6 +74,12 @@ test("scans repo and generates customized QA assets", async () => {
   const sonar = assets.files.find((file) => file.path === "sonar-project.properties");
   assert.match(sonar.content, /sonar.sources=app,pages,src/);
   assert.match(sonar.content, /sonar.javascript.lcov.reportPaths=coverage\/lcov.info/);
+  const k6 = assets.files.find((file) => file.path === "tests/performance/load.js");
+  assert.equal(k6.content.includes("/api/orders/sample"), true);
+  assert.equal(k6.content.includes("QA_API_API_HEALTH"), true);
+  const grype = assets.files.find((file) => file.path === ".grype.yaml");
+  assert.match(grype.content, /Detected manifests: Dockerfile, package-lock.json, package.json/);
+  assert.match(assets.packageJson, /--fail-on high/);
   const journeySpec = assets.files.find((file) => file.path === "tests/e2e/user-journeys.spec.ts");
   assert.match(journeySpec.content, /"title": "checkout"/);
   assert.match(journeySpec.content, /QA_ROUTE_PRODUCTS_PARAM/);
@@ -102,6 +112,19 @@ test("creates repo-aware SonarQube properties", async () => {
   assert.match(properties, /sonar.tests=tests/);
   assert.match(properties, /sonar.exclusions=.*node_modules/);
   assert.match(properties, /sonar.coverage.exclusions=/);
+});
+
+test("creates repo-aware security scan config", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const targets = discoverSecurityTargets(scan);
+  const config = createGrypeConfig(scan);
+
+  assert.equal(targets.hasContainer, true);
+  assert.equal(targets.hasNodeLockfile, true);
+  assert.equal(targets.manifests.includes("Dockerfile"), true);
+  assert.match(config, /Grype scans dependency manifests/);
+  assert.match(config, /Detected manifests: Dockerfile, package-lock.json, package.json/);
 });
 
 test("discovers unit test targets from scanned repo files", async () => {
