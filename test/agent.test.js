@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
+import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -44,7 +45,11 @@ test("scans repo and generates customized QA assets", async () => {
   assert.equal(stack.hasFrontend, true);
   assert.match(assets.packageJson, /qa:e2e/);
   assert.match(assets.packageJson, /qa:journeys/);
+  assert.match(assets.packageJson, /qa:report/);
+  assert.match(assets.packageJson, /qa:all/);
   assert.equal(assets.files.some((file) => file.path === "tests/e2e/critical-journey.spec.ts"), true);
+  assert.equal(assets.files.some((file) => file.path === "scripts/qa-report.mjs"), true);
+  assert.equal(assets.files.some((file) => file.path === "scripts/qa-run-all.mjs"), true);
   const journeySpec = assets.files.find((file) => file.path === "tests/e2e/user-journeys.spec.ts");
   assert.match(journeySpec.content, /"title": "checkout"/);
   assert.match(journeySpec.content, /QA_ROUTE_PRODUCTS_PARAM/);
@@ -123,4 +128,42 @@ test("generates an Excel-compatible Playwright report", async () => {
   assert.equal(summary.failed, 1);
   assert.match(workbook, /<Worksheet ss:Name="Summary">/);
   assert.match(workbook, /button missing/);
+});
+
+test("generated QA reporter summarizes all available artifacts", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const assets = generateAssets(scan, createTestPlan(scan, detectStack(scan)));
+  await applyAssets(dir, assets);
+
+  await fs.mkdir(path.join(dir, "playwright-report"), { recursive: true });
+  await fs.mkdir(path.join(dir, "qa-results"), { recursive: true });
+  await fs.mkdir(path.join(dir, "coverage"), { recursive: true });
+  await fs.writeFile(path.join(dir, "playwright-report", "results.json"), JSON.stringify({
+    suites: [{ specs: [{ tests: [{ results: [{ status: "passed" }] }] }] }],
+  }), "utf8");
+  await fs.writeFile(path.join(dir, "qa-results", "vitest.json"), JSON.stringify({
+    numTotalTests: 2,
+    numPassedTests: 1,
+    numFailedTests: 1,
+    numPendingTests: 0,
+  }), "utf8");
+  await fs.writeFile(path.join(dir, "qa-results", "newman.json"), JSON.stringify({
+    run: { stats: { assertions: { total: 3, failed: 0, pending: 0 } } },
+  }), "utf8");
+  await fs.writeFile(path.join(dir, "qa-results", "k6-summary.json"), JSON.stringify({
+    metrics: { checks: { values: { passes: 4, fails: 0 } } },
+  }), "utf8");
+  await fs.writeFile(path.join(dir, "qa-results", "grype.json"), JSON.stringify({ matches: [] }), "utf8");
+  await fs.writeFile(path.join(dir, "coverage", "lcov.info"), "LF:10\nLH:8\nFNF:5\nFNH:5\nBRF:4\nBRH:2\n", "utf8");
+
+  const result = spawnSync("node", ["scripts/qa-report.mjs"], { cwd: dir, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(await fs.readFile(path.join(dir, "qa-results", "qa-report.json"), "utf8"));
+  const workbook = await fs.readFile(path.join(dir, "qa-results", "qa-report.xls"), "utf8");
+
+  assert.equal(report.summary.total, 10);
+  assert.equal(report.summary.failed, 1);
+  assert.equal(report.rows.some((row) => row.tool === "coverage" && row.coverage.includes("lines 80%")), true);
+  assert.match(workbook, /<Worksheet ss:Name="Tools">/);
 });

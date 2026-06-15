@@ -53,9 +53,17 @@ Depending on the repo, the agent can add:
   "qa:security": "grype .",
   "qa:quality": "sonar-scanner",
   "qa:perf": "k6 run tests/performance/load.js",
-  "qa:all": "npm run qa:unit && npm run qa:e2e && npm run qa:api && npm run qa:security && npm run qa:perf"
+  "qa:report": "node scripts/qa-report.mjs",
+  "qa:all": "node scripts/qa-run-all.mjs"
 }
 ```
+
+`qa:all` runs the generated QA stages in order and then writes a consolidated report even if one of the test stages fails. The report outputs:
+
+- `qa-results/qa-report.json`
+- `qa-results/qa-report.xls`
+
+The consolidated report summarizes available Vitest, Playwright, Postman/Newman, Grype, k6, and LCOV coverage artifacts.
 
 ## Philosophy
 

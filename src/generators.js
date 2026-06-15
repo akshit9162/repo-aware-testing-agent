@@ -166,6 +166,196 @@ export default function () {
 }
 `;
 
+function createQaRunAll(order) {
+  return `import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+
+const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+const order = ${JSON.stringify(order, null, 2)};
+let failed = false;
+
+for (const script of order) {
+  if (!pkg.scripts?.[script] || script === 'qa:all' || script === 'qa:report' || script === 'qa:prepare') continue;
+  const result = spawnSync('npm', ['run', script], { stdio: 'inherit', shell: process.platform === 'win32' });
+  if (result.status !== 0) failed = true;
+}
+
+if (pkg.scripts?.['qa:report']) {
+  const report = spawnSync('npm', ['run', 'qa:report'], { stdio: 'inherit', shell: process.platform === 'win32' });
+  if (report.status !== 0) failed = true;
+}
+
+process.exit(failed ? 1 : 0);
+`;
+}
+
+const QA_REPORT = `import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+
+const root = process.cwd();
+const outDir = path.join(root, 'qa-results');
+mkdirSync(outDir, { recursive: true });
+
+function readJson(rel) {
+  const file = path.join(root, rel);
+  if (!existsSync(file)) return null;
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch (error) {
+    return { parseError: error.message };
+  }
+}
+
+function pct(value) {
+  return Number.isFinite(value) ? Math.round(value * 100) / 100 : null;
+}
+
+function escapeXml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+function row(cells) {
+  return '<Row>' + cells.map((cell) => '<Cell><Data ss:Type="String">' + escapeXml(cell) + '</Data></Cell>').join('') + '</Row>';
+}
+
+function worksheet(name, rows) {
+  return '<Worksheet ss:Name="' + escapeXml(name) + '"><Table>' + rows.join('') + '</Table></Worksheet>';
+}
+
+function summarizeLcov() {
+  const file = path.join(root, 'coverage', 'lcov.info');
+  if (!existsSync(file)) return null;
+  const text = readFileSync(file, 'utf8');
+  const found = { lines: 0, linesHit: 0, functions: 0, functionsHit: 0, branches: 0, branchesHit: 0 };
+  for (const line of text.split(/\\r?\\n/)) {
+    const [key, raw] = line.split(':');
+    const value = Number(raw);
+    if (key === 'LF') found.lines += value;
+    if (key === 'LH') found.linesHit += value;
+    if (key === 'FNF') found.functions += value;
+    if (key === 'FNH') found.functionsHit += value;
+    if (key === 'BRF') found.branches += value;
+    if (key === 'BRH') found.branchesHit += value;
+  }
+  return {
+    lines: pct(found.lines ? (found.linesHit / found.lines) * 100 : 0),
+    functions: pct(found.functions ? (found.functionsHit / found.functions) * 100 : 0),
+    branches: pct(found.branches ? (found.branchesHit / found.branches) * 100 : 0),
+  };
+}
+
+function playwrightStatus(test) {
+  const results = test.results || [];
+  if (!results.length) return 'unknown';
+  if (results.some((result) => result.status === 'failed' || result.status === 'timedOut')) return 'failed';
+  if (results.every((result) => result.status === 'skipped')) return 'skipped';
+  if (results.some((result) => result.status === 'passed')) return 'passed';
+  return results.at(-1)?.status || 'unknown';
+}
+
+function flattenPlaywrightSuite(suite, rows = []) {
+  for (const spec of suite.specs || []) {
+    for (const test of spec.tests || []) rows.push(playwrightStatus(test));
+  }
+  for (const child of suite.suites || []) flattenPlaywrightSuite(child, rows);
+  return rows;
+}
+
+function addPlaywright(report, rows) {
+  if (!report) return;
+  const statuses = (report.suites || []).flatMap((suite) => flattenPlaywrightSuite(suite));
+  const passed = statuses.filter((status) => status === 'passed').length;
+  const failed = statuses.filter((status) => status === 'failed').length;
+  const skipped = statuses.filter((status) => status === 'skipped').length;
+  rows.push({ tool: 'playwright', status: failed ? 'failed' : 'passed', total: statuses.length, passed, failed, skipped, coverage: '', source: 'playwright-report/results.json' });
+}
+
+function addVitest(report, rows) {
+  if (!report) return;
+  const total = report.numTotalTests ?? report.totalTests ?? 0;
+  const passed = report.numPassedTests ?? report.passedTests ?? 0;
+  const failed = report.numFailedTests ?? report.failedTests ?? 0;
+  const skipped = report.numPendingTests ?? report.numTodoTests ?? report.skippedTests ?? 0;
+  rows.push({ tool: 'vitest', status: failed ? 'failed' : 'passed', total, passed, failed, skipped, coverage: '', source: 'qa-results/vitest.json' });
+}
+
+function addNewman(report, rows) {
+  if (!report) return;
+  const assertions = report.run?.stats?.assertions || {};
+  rows.push({
+    tool: 'postman',
+    status: assertions.failed ? 'failed' : 'passed',
+    total: assertions.total || 0,
+    passed: (assertions.total || 0) - (assertions.failed || 0),
+    failed: assertions.failed || 0,
+    skipped: assertions.pending || 0,
+    coverage: '',
+    source: 'qa-results/newman.json',
+  });
+}
+
+function addK6(report, rows) {
+  if (!report) return;
+  const checks = report.metrics?.checks?.values || {};
+  const passed = checks.passes || 0;
+  const failed = checks.fails || 0;
+  rows.push({ tool: 'k6', status: failed ? 'failed' : 'passed', total: passed + failed, passed, failed, skipped: 0, coverage: '', source: 'qa-results/k6-summary.json' });
+}
+
+function addGrype(report, rows) {
+  if (!report) return;
+  const total = Array.isArray(report.matches) ? report.matches.length : 0;
+  rows.push({ tool: 'grype', status: total ? 'failed' : 'passed', total, passed: 0, failed: total, skipped: 0, coverage: '', source: 'qa-results/grype.json' });
+}
+
+const rows = [];
+addPlaywright(readJson('playwright-report/results.json'), rows);
+addVitest(readJson('qa-results/vitest.json'), rows);
+addNewman(readJson('qa-results/newman.json'), rows);
+addK6(readJson('qa-results/k6-summary.json'), rows);
+addGrype(readJson('qa-results/grype.json'), rows);
+
+const lcov = summarizeLcov();
+if (lcov) {
+  rows.push({ tool: 'coverage', status: 'reported', total: '', passed: '', failed: '', skipped: '', coverage: 'lines ' + lcov.lines + '%, functions ' + lcov.functions + '%, branches ' + lcov.branches + '%', source: 'coverage/lcov.info' });
+}
+
+const summary = rows.reduce((acc, item) => {
+  acc.total += Number(item.total) || 0;
+  acc.passed += Number(item.passed) || 0;
+  acc.failed += Number(item.failed) || 0;
+  acc.skipped += Number(item.skipped) || 0;
+  if (item.status === 'failed') acc.status = 'failed';
+  return acc;
+}, { status: 'passed', total: 0, passed: 0, failed: 0, skipped: 0 });
+
+const report = { generatedAt: new Date().toISOString(), summary, rows };
+writeFileSync(path.join(outDir, 'qa-report.json'), JSON.stringify(report, null, 2) + '\\n');
+
+const workbook = '<?xml version="1.0"?>\\n<?mso-application progid="Excel.Sheet"?>\\n<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">' +
+  worksheet('Summary', [
+    row(['Metric', 'Value']),
+    row(['Status', summary.status]),
+    row(['Total checks', summary.total]),
+    row(['Passed', summary.passed]),
+    row(['Failed', summary.failed]),
+    row(['Skipped', summary.skipped]),
+    row(['Generated at', report.generatedAt]),
+  ]) +
+  worksheet('Tools', [
+    row(['Tool', 'Status', 'Total', 'Passed', 'Failed', 'Skipped', 'Coverage', 'Source']),
+    ...rows.map((item) => row([item.tool, item.status, item.total, item.passed, item.failed, item.skipped, item.coverage, item.source])),
+  ]) +
+  '</Workbook>\\n';
+writeFileSync(path.join(outDir, 'qa-report.xls'), workbook);
+
+console.log(JSON.stringify({ output: ['qa-results/qa-report.json', 'qa-results/qa-report.xls'], summary }, null, 2));
+`;
+
 function hasScript(pkg, name) {
   return Boolean(pkg?.scripts?.[name]);
 }
@@ -185,6 +375,9 @@ export function generateAssets(scan, plan) {
 
   const files = [];
   const deps = pkg.devDependencies;
+  const qaOrder = plan.recommendedOrder.filter((script) => script !== "qa:all" && script !== "qa:report");
+
+  addScript(pkg.scripts, "qa:prepare", "node -e \"require('fs').mkdirSync('qa-results',{recursive:true})\"");
 
   if (plan.stack.hasFrontend) {
     const journeys = discoverUserJourneys(scan.files);
@@ -199,28 +392,31 @@ export function generateAssets(scan, plan) {
   }
 
   if (!hasScript(pkg, "qa:unit")) {
-    addScript(pkg.scripts, "qa:unit", "vitest run");
+    addScript(pkg.scripts, "qa:unit", "npm run qa:prepare && vitest run --coverage --reporter=json --outputFile=qa-results/vitest.json");
   }
   addDevDependency(deps, "vitest", "^4.1.5");
+  addDevDependency(deps, "@vitest/coverage-v8", "^4.1.5");
   files.push({ path: "tests/unit/qa-baseline.test.js", content: VITEST });
 
   addScript(pkg.scripts, "qa:quality", "sonar-scanner");
   files.push({ path: "sonar-project.properties", content: SONAR });
 
   if (plan.stack.hasApi) {
-    addScript(pkg.scripts, "qa:api", "newman run postman/qa-collection.json -e postman/qa-env.json");
-    addScript(pkg.scripts, "qa:perf", "k6 run tests/performance/load.js");
+    addScript(pkg.scripts, "qa:api", "npm run qa:prepare && newman run postman/qa-collection.json -e postman/qa-env.json --reporters cli,json --reporter-json-export qa-results/newman.json");
+    addScript(pkg.scripts, "qa:perf", "npm run qa:prepare && k6 run --summary-export qa-results/k6-summary.json tests/performance/load.js");
     addDevDependency(deps, "newman", "^6.2.1");
     files.push({ path: "postman/qa-collection.json", content: POSTMAN });
     files.push({ path: "postman/qa-env.json", content: POSTMAN_ENV });
     files.push({ path: "tests/performance/load.js", content: K6 });
   }
 
-  addScript(pkg.scripts, "qa:security", "grype .");
+  addScript(pkg.scripts, "qa:security", "npm run qa:prepare && grype . -o json > qa-results/grype.json");
+  addScript(pkg.scripts, "qa:report", "node scripts/qa-report.mjs");
 
-  const qaAll = plan.recommendedOrder.filter((script) => pkg.scripts[script]).map((script) => `npm run ${script}`).join(" && ");
-  if (qaAll) addScript(pkg.scripts, "qa:all", qaAll);
+  if (qaOrder.some((script) => pkg.scripts[script])) addScript(pkg.scripts, "qa:all", "node scripts/qa-run-all.mjs");
 
+  files.push({ path: "scripts/qa-run-all.mjs", content: createQaRunAll(qaOrder) });
+  files.push({ path: "scripts/qa-report.mjs", content: QA_REPORT });
   files.push({ path: "qa-plan.json", content: `${JSON.stringify(plan, null, 2)}\n` });
 
   return {
