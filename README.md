@@ -46,6 +46,7 @@ Depending on the repo, the agent can add:
 ```json
 {
   "qa:smoke": "playwright test tests/smoke",
+  "qa:journeys": "playwright test tests/e2e/user-journeys.spec.ts",
   "qa:e2e": "playwright test tests/e2e",
   "qa:unit": "vitest run",
   "qa:api": "newman run postman/qa-collection.json",
@@ -64,5 +65,9 @@ Generated tests are intentionally configurable through environment variables suc
 
 - `QA_BASE_URL`
 - `QA_SMOKE_PATH`
+- `QA_ROUTE_HOME`
+- `QA_ROUTE_<ROUTE_NAME>`
 - `QA_API_BASE_URL`
 - `QA_K6_URL`
+
+For frontend repos, the agent discovers likely user journeys from common route files such as `app/**/page.tsx`, `pages/**/*.tsx`, `src/pages/**/*.tsx`, and `src/routes/**/*.tsx`. It generates `tests/e2e/user-journeys.spec.ts` with one Playwright test per route and safe form-control interaction coverage. Dynamic routes use sample placeholders and can be overridden with the generated `QA_ROUTE_*` environment variables.

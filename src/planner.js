@@ -55,13 +55,14 @@ export function createTestPlan(scan, stack) {
     recommendedOrder: [
       "qa:unit",
       "qa:smoke",
+      "qa:journeys",
       "qa:e2e",
       "qa:api",
       "qa:quality",
       "qa:security",
       "qa:perf",
     ].filter((script) => {
-      if (script === "qa:smoke" || script === "qa:e2e") return stack.hasFrontend;
+      if (script === "qa:smoke" || script === "qa:journeys" || script === "qa:e2e") return stack.hasFrontend;
       if (script === "qa:api" || script === "qa:perf") return stack.hasApi;
       return true;
     }),

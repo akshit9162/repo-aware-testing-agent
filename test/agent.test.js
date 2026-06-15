@@ -9,6 +9,7 @@ import {
   createTestPlan,
   generateAssets,
   applyAssets,
+  discoverUserJourneys,
   summarizePlaywrightReport,
   writePlaywrightCoverageExcel,
 } from "../src/index.js";
@@ -19,11 +20,16 @@ async function makeFixture() {
   await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({
     type: "module",
     scripts: { test: "vitest run" },
-    dependencies: { react: "^18.3.1" },
+    dependencies: { next: "^15.0.0", react: "^18.3.1" },
     devDependencies: { vite: "^7.0.0" }
   }, null, 2));
   await fs.writeFile(path.join(dir, "vite.config.ts"), "export default {}");
   await fs.writeFile(path.join(dir, "src", "App.tsx"), "export function App(){ return <div/> }");
+  await fs.mkdir(path.join(dir, "app", "checkout"), { recursive: true });
+  await fs.mkdir(path.join(dir, "app", "products", "[id]"), { recursive: true });
+  await fs.writeFile(path.join(dir, "app", "page.tsx"), "export default function Page(){ return <main/> }");
+  await fs.writeFile(path.join(dir, "app", "checkout", "page.tsx"), "export default function Page(){ return <main/> }");
+  await fs.writeFile(path.join(dir, "app", "products", "[id]", "page.tsx"), "export default function Page(){ return <main/> }");
   return dir;
 }
 
@@ -34,10 +40,28 @@ test("scans repo and generates customized QA assets", async () => {
   const plan = createTestPlan(scan, stack);
   const assets = generateAssets(scan, plan);
 
-  assert.equal(stack.framework, "vite");
+  assert.equal(stack.framework, "next");
   assert.equal(stack.hasFrontend, true);
   assert.match(assets.packageJson, /qa:e2e/);
+  assert.match(assets.packageJson, /qa:journeys/);
   assert.equal(assets.files.some((file) => file.path === "tests/e2e/critical-journey.spec.ts"), true);
+  const journeySpec = assets.files.find((file) => file.path === "tests/e2e/user-journeys.spec.ts");
+  assert.match(journeySpec.content, /"title": "checkout"/);
+  assert.match(journeySpec.content, /QA_ROUTE_PRODUCTS_PARAM/);
+});
+
+test("discovers user journeys from route files", async () => {
+  const journeys = discoverUserJourneys([
+    "app/page.tsx",
+    "app/account/page.tsx",
+    "app/products/[id]/page.tsx",
+    "pages/login.tsx",
+    "pages/api/health.ts",
+    "src/routes/settings.tsx",
+  ]);
+
+  assert.deepEqual(journeys.map((journey) => journey.path), ["/", "/account", "/login", "/products/sample", "/settings"]);
+  assert.equal(journeys.find((journey) => journey.path === "/products/sample").env, "QA_ROUTE_PRODUCTS_PARAM");
 });
 
 test("applies assets without overwriting existing files", async () => {
