@@ -11,6 +11,8 @@ A standalone QA automation agent that scans a repository and generates a customi
 
 It inspects the target repo, builds a risk-aware test plan, then optionally writes starter configs, test files, Postman collections, k6 scripts, and `package.json` QA scripts.
 
+Unit tests are generated from the repo scan. The agent creates a baseline Vitest harness plus a repo-specific regression manifest that checks detected package scripts, source files, UI routes, API files, component files, config files, and environment contract files.
+
 ## Usage
 
 Preview a plan without writing files:

@@ -11,6 +11,7 @@ import {
   generateAssets,
   applyAssets,
   discoverUserJourneys,
+  discoverUnitTestTargets,
   summarizePlaywrightReport,
   writePlaywrightCoverageExcel,
 } from "../src/index.js";
@@ -25,7 +26,11 @@ async function makeFixture() {
     devDependencies: { vite: "^7.0.0" }
   }, null, 2));
   await fs.writeFile(path.join(dir, "vite.config.ts"), "export default {}");
+  await fs.writeFile(path.join(dir, ".env.example"), "NEXT_PUBLIC_API_URL=http://localhost:3000\n");
   await fs.writeFile(path.join(dir, "src", "App.tsx"), "export function App(){ return <div/> }");
+  await fs.writeFile(path.join(dir, "src", "PriceCard.tsx"), "export function PriceCard(){ return <article/> }");
+  await fs.mkdir(path.join(dir, "pages", "api"), { recursive: true });
+  await fs.writeFile(path.join(dir, "pages", "api", "health.ts"), "export default function handler(){}");
   await fs.mkdir(path.join(dir, "app", "checkout"), { recursive: true });
   await fs.mkdir(path.join(dir, "app", "products", "[id]"), { recursive: true });
   await fs.writeFile(path.join(dir, "app", "page.tsx"), "export default function Page(){ return <main/> }");
@@ -48,11 +53,29 @@ test("scans repo and generates customized QA assets", async () => {
   assert.match(assets.packageJson, /qa:report/);
   assert.match(assets.packageJson, /qa:all/);
   assert.equal(assets.files.some((file) => file.path === "tests/e2e/critical-journey.spec.ts"), true);
+  assert.equal(assets.files.some((file) => file.path === "tests/unit/qa-generated-regression.test.js"), true);
   assert.equal(assets.files.some((file) => file.path === "scripts/qa-report.mjs"), true);
   assert.equal(assets.files.some((file) => file.path === "scripts/qa-run-all.mjs"), true);
+  const unitSpec = assets.files.find((file) => file.path === "tests/unit/qa-generated-regression.test.js");
+  assert.equal(unitSpec.content.includes("src/PriceCard.tsx"), true);
+  assert.equal(unitSpec.content.includes("pages/api/health.ts"), true);
+  assert.equal(unitSpec.content.includes(".env.example"), true);
   const journeySpec = assets.files.find((file) => file.path === "tests/e2e/user-journeys.spec.ts");
   assert.match(journeySpec.content, /"title": "checkout"/);
   assert.match(journeySpec.content, /QA_ROUTE_PRODUCTS_PARAM/);
+});
+
+test("discovers unit test targets from scanned repo files", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const targets = discoverUnitTestTargets(scan);
+
+  assert.equal(targets.packageScripts.includes("test"), true);
+  assert.equal(targets.sourceFiles.includes("src/App.tsx"), true);
+  assert.equal(targets.componentFiles.includes("src/PriceCard.tsx"), true);
+  assert.equal(targets.apiFiles.includes("pages/api/health.ts"), true);
+  assert.equal(targets.envFiles.includes(".env.example"), true);
+  assert.equal(targets.configFiles.includes("vite.config.ts"), true);
 });
 
 test("discovers user journeys from route files", async () => {

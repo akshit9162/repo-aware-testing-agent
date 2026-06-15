@@ -1,4 +1,5 @@
 import { discoverUserJourneys } from "./journeys.js";
+import { discoverUnitTestTargets } from "./unitDiscovery.js";
 
 const PLAYWRIGHT_CONFIG = `import { defineConfig, devices } from '@playwright/test';
 
@@ -100,6 +101,57 @@ describe('QA unit baseline', () => {
   });
 });
 `;
+
+function createGeneratedUnitTests(targets) {
+  return `import { describe, expect, it } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+
+const root = process.cwd();
+const manifest = ${JSON.stringify(targets, null, 2)};
+
+function repoPath(file) {
+  return path.join(root, file);
+}
+
+describe('QA generated unit coverage manifest', () => {
+  it('keeps package scripts available for the detected QA workflow', () => {
+    const pkg = JSON.parse(readFileSync(repoPath('package.json'), 'utf8'));
+    for (const script of manifest.packageScripts) {
+      expect(pkg.scripts, 'package script "' + script + '" should exist').toHaveProperty(script);
+    }
+  });
+
+  it.each(manifest.sourceFiles)('source file exists: %s', (file) => {
+    expect(existsSync(repoPath(file))).toBe(true);
+  });
+
+  it.each(manifest.configFiles)('config file exists: %s', (file) => {
+    expect(existsSync(repoPath(file))).toBe(true);
+  });
+
+  it.each(manifest.routeFiles)('ui route file exists: %s', (file) => {
+    expect(existsSync(repoPath(file))).toBe(true);
+  });
+
+  it.each(manifest.apiFiles)('api unit target exists: %s', (file) => {
+    expect(existsSync(repoPath(file))).toBe(true);
+  });
+
+  it.each(manifest.componentFiles)('component unit target exists: %s', (file) => {
+    expect(existsSync(repoPath(file))).toBe(true);
+  });
+
+  it.each(manifest.envFiles)('environment contract file exists: %s', (file) => {
+    expect(existsSync(repoPath(file))).toBe(true);
+  });
+
+  it('records whether large target groups were truncated', () => {
+    expect(manifest.truncated).toEqual(expect.any(Object));
+  });
+});
+`;
+}
 
 const SONAR = `sonar.projectKey=repo-aware-qa
 sonar.projectName=Repo Aware QA
@@ -434,6 +486,7 @@ export function generateAssets(scan, plan) {
   addDevDependency(deps, "vitest", "^4.1.5");
   addDevDependency(deps, "@vitest/coverage-v8", "^4.1.5");
   files.push({ path: "tests/unit/qa-baseline.test.js", content: VITEST });
+  files.push({ path: "tests/unit/qa-generated-regression.test.js", content: createGeneratedUnitTests(discoverUnitTestTargets(scan)) });
 
   addScript(pkg.scripts, "qa:quality", "sonar-scanner");
   files.push({ path: "sonar-project.properties", content: SONAR });

@@ -5,3 +5,4 @@ export { generateAssets } from "./generators.js";
 export { applyAssets } from "./writer.js";
 export { createPlaywrightCoverageWorkbook, summarizePlaywrightReport, writePlaywrightCoverageExcel } from "./playwrightExcel.js";
 export { discoverUserJourneys } from "./journeys.js";
+export { discoverUnitTestTargets } from "./unitDiscovery.js";
