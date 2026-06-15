@@ -1,0 +1,10 @@
+{
+  "summary": "Custom QA workflow for a TypeScript Vite repository.",
+  "stages": [
+    "qa:unit",
+    "qa:smoke",
+    "qa:e2e",
+    "qa:quality",
+    "qa:security"
+  ]
+}
