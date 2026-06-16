@@ -8,4 +8,4 @@ export { discoverUserJourneys } from "./journeys.js";
 export { discoverUnitTestTargets } from "./unitDiscovery.js";
 export { discoverApiEndpoints } from "./apiDiscovery.js";
 export { createSonarProperties } from "./sonarDiscovery.js";
-export { createGrypeConfig, discoverSecurityTargets } from "./securityDiscovery.js";
+export { createTrivyIgnore, discoverSecurityTargets } from "./securityDiscovery.js";

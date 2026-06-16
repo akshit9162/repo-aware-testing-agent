@@ -1,12 +1,11 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-async function exists(filePath) {
+async function readIfExists(filePath) {
   try {
-    await fs.access(filePath);
-    return true;
+    return await fs.readFile(filePath, "utf8");
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -14,13 +13,25 @@ export async function applyAssets(repoPath, assets, options = {}) {
   const root = path.resolve(repoPath);
   const written = [];
   const skipped = [];
+  const unchanged = [];
 
-  await fs.writeFile(path.join(root, "package.json"), assets.packageJson, "utf8");
-  written.push("package.json");
+  const pkgPath = path.join(root, "package.json");
+  const existingPkg = await readIfExists(pkgPath);
+  if (existingPkg === assets.packageJson) {
+    unchanged.push("package.json");
+  } else {
+    await fs.writeFile(pkgPath, assets.packageJson, "utf8");
+    written.push("package.json");
+  }
 
   for (const file of assets.files) {
     const full = path.join(root, file.path);
-    if (!options.overwrite && await exists(full)) {
+    const existing = await readIfExists(full);
+    if (existing === file.content) {
+      unchanged.push(file.path);
+      continue;
+    }
+    if (existing !== null && !options.overwrite) {
       skipped.push(file.path);
       continue;
     }
@@ -29,5 +40,5 @@ export async function applyAssets(repoPath, assets, options = {}) {
     written.push(file.path);
   }
 
-  return { written, skipped };
+  return { written, skipped, unchanged };
 }
