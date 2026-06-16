@@ -6,7 +6,7 @@ A standalone QA automation agent that scans a repository and generates a customi
 - Vitest
 - SonarQube
 - Postman/Newman
-- Grype
+- Trivy
 - k6
 
 It inspects the target repo, builds a risk-aware test plan, then optionally writes starter configs, test files, Postman collections, k6 scripts, and `package.json` QA scripts.
@@ -15,7 +15,9 @@ Unit tests are generated from the repo scan. The agent creates a baseline Vitest
 
 API tests are generated from detected API route files such as `pages/api/**`, `app/api/**/route.ts`, and `src/routes/**`. The Postman collection validates server-error status, response time, and JSON parseability when JSON is advertised. SonarQube configuration is generated from detected source/test folders with LCOV coverage and common build/report exclusions.
 
-Security and performance checks are also generated from the scan. The agent writes `.grype.yaml` and a `qa:security` script that fails on high/critical vulnerabilities while exporting `qa-results/grype.json`. For API repos, it generates a k6 script that load-tests each discovered endpoint with response-time and success-rate thresholds.
+Security and performance checks are also generated from the scan. The agent writes `.trivyignore` and a `qa:security` script that exports `qa-results/trivy.json`; severity gating is applied by `scripts/qa-run-all.mjs` via `--fail-on` (default `high`). For API repos, it generates a k6 script that load-tests each discovered endpoint with response-time and success-rate thresholds.
+
+Requires `trivy` on PATH (`brew install trivy` on macOS; see https://trivy.dev/ for other platforms).
 
 ## Usage
 

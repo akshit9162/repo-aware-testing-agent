@@ -1,12 +1,35 @@
 const SOURCE_RE = /\.(js|jsx|ts|tsx|mjs|cjs)$/;
 const TEST_RE = /(\.test\.|\.spec\.|__tests__\/|\/tests?\/)/;
 
+const QA_SCAFFOLD_PATHS = new Set([
+  "playwright.config.ts",
+  "playwright.config.js",
+  "sonar-project.properties",
+  ".trivyignore",
+  "qa-plan.json",
+  "scripts/qa-run-all.mjs",
+  "scripts/qa-report.mjs",
+  "tests/unit/qa-baseline.test.js",
+  "tests/unit/qa-generated-regression.test.js",
+  "tests/smoke/qa-smoke.spec.ts",
+  "tests/e2e/critical-journey.spec.ts",
+  "tests/e2e/user-journeys.spec.ts",
+  "tests/performance/load.js",
+  "postman/qa-collection.json",
+  "postman/qa-env.json",
+]);
+
+function isQaScaffold(file) {
+  return QA_SCAFFOLD_PATHS.has(file);
+}
+
 function isSourceFile(file) {
   return SOURCE_RE.test(file)
     && !TEST_RE.test(file)
     && !file.endsWith(".d.ts")
     && !file.includes("/stories.")
-    && !file.includes(".stories.");
+    && !file.includes(".stories.")
+    && !isQaScaffold(file);
 }
 
 function isComponentFile(file) {
@@ -40,9 +63,11 @@ export function discoverUnitTestTargets(scan) {
   const routeFiles = files.filter(isRouteFile).sort();
   const apiFiles = files.filter(isApiFile).sort();
   const componentFiles = files.filter(isComponentFile).sort();
-  const configFiles = files.filter(isConfigFile).sort();
+  const configFiles = files.filter((file) => isConfigFile(file) && !isQaScaffold(file)).sort();
   const envFiles = files.filter((file) => /^\.env(\.|$)|(^|\/)\.env\.example$|(^|\/)env\.example$/.test(file)).sort();
-  const packageScripts = Object.keys(scan.packageJson?.scripts || {}).sort();
+  const packageScripts = Object.keys(scan.packageJson?.scripts || {})
+    .filter((name) => !name.startsWith("qa:"))
+    .sort();
 
   return {
     packageScripts,
