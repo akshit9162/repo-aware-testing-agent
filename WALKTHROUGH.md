@@ -46,6 +46,19 @@ The agent uses the key to write per-route assertions into
 `tests/e2e/user-journeys.spec.ts`. Without a key, `--write` aborts with a
 clear error before any files are touched.
 
+**Where to put keys.** Drop them in a `.env` (or `.env.local`) at the
+repo root and the agent loads them automatically:
+
+```
+# /path/to/your/repo/.env
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-proj-...
+```
+
+Add `.env` to `.gitignore` so it doesn't end up in version control. Real
+shell exports always take precedence over the file (so CI secrets aren't
+shadowed by a stale `.env`).
+
 ## Quick start
 
 ```sh
@@ -272,17 +285,16 @@ trigger 429s. The agent retries with exponential backoff and respects
 `Retry-After` headers, so it finishes eventually — but a 49-route fresh
 run takes ~10 minutes. Cached routes are instant on subsequent runs.
 
-### `next start` requires `next build` first
+### Production mode is the default; build runs automatically
 
-The orchestrator prefers `npm run dev` to avoid this — `dev` is a single
-command that doesn't require a prior build. If you want production-mode
-behavior (faster runtime, no cold compiles):
+When the orchestrator sees a `start` script in `package.json`, it runs
+`npm run build` first and then `npm run start` — production-mode
+serving, no dev-mode cold compiles. To skip the build step (e.g. when
+you already built recently), set `QA_BUILD=0`. To force dev mode:
 
 ```sh
-QA_APP_SERVER=start npm run qa:all
+QA_APP_SERVER=dev npm run qa:all
 ```
-
-…but make sure you've run `npm run build` first.
 
 ### CI mode: app already deployed
 

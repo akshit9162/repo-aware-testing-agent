@@ -2,6 +2,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, mergeJourneys, importHar, repair } from "./index.js";
+import { loadDotenv } from "./loadEnv.js";
 import { writePlaywrightCoverageExcel } from "./playwrightExcel.js";
 
 const KNOWN_TOOLS = ["playwright", "vitest", "sonarqube", "postman", "trivy", "k6", "axe", "gitleaks", "semgrep", "visual"];
@@ -166,6 +167,11 @@ function parseCoverageArgs(argv) {
 
 async function main() {
   const argv = process.argv.slice(2);
+  // Load .env / .env.local from CWD up-front so subcommands can rely on
+  // ANTHROPIC_API_KEY / OPENAI_API_KEY being populated without users having
+  // to export them every shell session. Existing exports always win.
+  await loadDotenv(process.cwd());
+
   if (argv[0] === "coverage-excel") {
     const args = parseCoverageArgs(argv);
     if (!args.inputPath) {
@@ -185,6 +191,9 @@ async function main() {
       throw new Error("repair: --base-url is required (the agent fetches the live DOM to ask the LLM for new selectors)");
     }
     const repoRoot = path.resolve(repairArgs.repoPath);
+    if (repoRoot !== path.resolve(process.cwd())) {
+      await loadDotenv(repoRoot);
+    }
     const result = await repair({
       resultsPath: path.resolve(repairArgs.input),
       repoRoot,
@@ -236,6 +245,12 @@ async function main() {
   }
 
   const args = parseArgs(argv);
+  // Also load .env from the *target* repo (if different from cwd) so keys can
+  // live alongside the project the agent is scanning.
+  const resolvedRepo = path.resolve(args.repoPath);
+  if (resolvedRepo !== path.resolve(process.cwd())) {
+    await loadDotenv(resolvedRepo);
+  }
   const scan = await scanRepository(args.repoPath);
   const stack = detectStack(scan);
   const plan = createTestPlan(scan, stack, { only: args.only, skip: args.skip });

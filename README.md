@@ -47,6 +47,9 @@ Provider selection:
 - `@anthropic-ai/sdk` and `openai` are declared as hard dependencies of
   the agent and installed by `npm install` in the agent dir. No soft
   fallback path.
+- Keys can live in `.env` (or `.env.local`) at the target repo root;
+  the agent auto-loads them on startup. Real shell exports always
+  override the file.
 
 Behaviour:
 

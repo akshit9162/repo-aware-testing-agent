@@ -558,13 +558,26 @@ async function waitForHealth(url, deadlineMs) {
 function pickAppServerScript() {
   const override = process.env.QA_APP_SERVER;
   if (override && pkg.scripts?.[override]) return override;
-  // Prefer 'dev' by default — it's a single command that doesn't require a prior build
-  // step, which makes the orchestrator usable on a fresh clone. Set QA_APP_SERVER=start
-  // (and ensure a production build exists) when you want production-mode behavior, e.g.
-  // for representative perf runs.
-  if (pkg.scripts?.dev) return 'dev';
+  // Prefer start (production-mode) when available; the runBuildScript step
+  // below runs npm run build first so the production server has something to
+  // serve. Falls back to dev where start does not exist (e.g. Vite).
   if (pkg.scripts?.start) return 'start';
+  if (pkg.scripts?.dev) return 'dev';
   return null;
+}
+
+async function runBuildScript() {
+  if (process.env.QA_BUILD === '0') return true;
+  if (!pkg.scripts?.build) return true;
+  return new Promise((resolve) => {
+    process.stdout.write('[qa:all] running npm run build before app server start\\n');
+    const child = spawn('npm', ['run', 'build'], {
+      stdio: 'inherit',
+      shell: process.platform === 'win32',
+    });
+    child.on('error', () => resolve(false));
+    child.on('close', (code) => resolve(code === 0));
+  });
 }
 
 async function withAppServer(run) {
@@ -576,6 +589,13 @@ async function withAppServer(run) {
   if (!startScript) {
     record('app-server', 'skipped', { reason: 'no dev/start script' });
     return run();
+  }
+  if (startScript === 'start') {
+    const built = await runBuildScript();
+    if (!built) {
+      record('app-server', 'failed', { reason: 'npm run build failed — set QA_BUILD=0 to skip' });
+      return false;
+    }
   }
   const logPath = path.join(RESULTS_DIR, 'app-server.log');
   const log = createWriteStream(logPath, { flags: 'a' });

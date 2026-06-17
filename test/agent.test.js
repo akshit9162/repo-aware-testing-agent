@@ -24,6 +24,7 @@ import {
   repair,
   extractRouteFromTitle,
   patchEnrichedBlock,
+  loadDotenv,
   summarizePlaywrightReport,
   writePlaywrightCoverageExcel,
 } from "../src/index.js";
@@ -617,6 +618,66 @@ test("importHar merges entries into postman collection with dedup", async () => 
   const post = collection.item.find((i) => i.request.method === "POST");
   assert.match(post.event[0].script.exec.join("\n"), /does not return server error/);
   assert.equal(post.request.body.raw, "{\"sku\":\"x\"}");
+});
+
+test("loadDotenv populates process.env from .env (quotes, comments, export prefix, existing wins)", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-env-"));
+  await fs.writeFile(path.join(dir, ".env"), [
+    "# top-level comment",
+    "QA_TEST_PLAIN=plain-value",
+    'QA_TEST_QUOTED="quoted spaces here"',
+    "QA_TEST_SQUOTED='single-quoted'",
+    "  QA_TEST_PADDED  =  trimmed  ",
+    "export QA_TEST_EXPORTED=exported-value",
+    "QA_TEST_PRESET=should-not-overwrite",
+    "",
+    "# trailing comment",
+  ].join("\n"));
+  // .env.local overrides? No — first-loaded file wins because existing values
+  // are preserved. .env.local is read first then .env; both honor the existing
+  // env precedence rule. So overlap with .env.local takes precedence.
+  await fs.writeFile(path.join(dir, ".env.local"), "QA_TEST_LOCAL_ONLY=local\n");
+
+  const preset = "QA_TEST_PRESET";
+  process.env[preset] = "preset-export";
+  for (const k of ["QA_TEST_PLAIN", "QA_TEST_QUOTED", "QA_TEST_SQUOTED", "QA_TEST_PADDED", "QA_TEST_EXPORTED", "QA_TEST_LOCAL_ONLY"]) {
+    delete process.env[k];
+  }
+
+  try {
+    const result = await loadDotenv(dir);
+    assert.equal(result.loaded.length, 2);
+    assert.equal(process.env.QA_TEST_PLAIN, "plain-value");
+    assert.equal(process.env.QA_TEST_QUOTED, "quoted spaces here");
+    assert.equal(process.env.QA_TEST_SQUOTED, "single-quoted");
+    assert.equal(process.env.QA_TEST_PADDED, "trimmed");
+    assert.equal(process.env.QA_TEST_EXPORTED, "exported-value");
+    assert.equal(process.env.QA_TEST_LOCAL_ONLY, "local");
+    assert.equal(process.env.QA_TEST_PRESET, "preset-export", "existing env vars must not be overridden");
+  } finally {
+    for (const k of ["QA_TEST_PLAIN", "QA_TEST_QUOTED", "QA_TEST_SQUOTED", "QA_TEST_PADDED", "QA_TEST_EXPORTED", "QA_TEST_PRESET", "QA_TEST_LOCAL_ONLY"]) {
+      delete process.env[k];
+    }
+  }
+});
+
+test("loadDotenv is a no-op when no files exist", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-env-noop-"));
+  const result = await loadDotenv(dir);
+  assert.deepEqual(result.loaded, []);
+  assert.deepEqual(result.setKeys, []);
+});
+
+test("orchestrator auto-builds when start is selected and a build script exists", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const assets = generateAssets(scan, createTestPlan(scan, detectStack(scan)));
+  const runAll = assets.files.find((f) => f.path === "scripts/qa-run-all.mjs");
+  assert.ok(runAll, "qa-run-all.mjs should be generated");
+  assert.match(runAll.content, /runBuildScript/);
+  assert.match(runAll.content, /npm run build before app server start/);
+  // prefer start over dev now
+  assert.match(runAll.content, /if \(pkg\.scripts\?\.start\) return 'start'/);
 });
 
 test("extractRouteFromTitle parses Playwright journey titles back to paths", () => {
