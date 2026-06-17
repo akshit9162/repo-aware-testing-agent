@@ -828,12 +828,16 @@ test("buildPlaywrightQaCases skips visual specs to avoid double-counting", async
   const dir = await makeFixture();
   const scan = await scanRepository(dir);
   const assets = generateAssets(scan, createTestPlan(scan, detectStack(scan)));
-  // Verify the qa scripts include per-stage PLAYWRIGHT_JSON_OUTPUT_FILE env vars
-  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report\/smoke\.json/);
-  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report\/journeys\.json/);
-  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report\/e2e\.json/);
-  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report\/a11y\.json/);
-  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report\/visual\.json/);
+  // Verify the qa scripts include per-stage PLAYWRIGHT_JSON_OUTPUT_FILE env
+  // vars pointing at qa-results/ (NOT playwright-report/, which Playwright's
+  // html reporter wipes between stages and would erase the per-stage outputs).
+  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results\/playwright-smoke\.json/);
+  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results\/playwright-journeys\.json/);
+  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results\/playwright-e2e\.json/);
+  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results\/playwright-a11y\.json/);
+  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results\/playwright-visual\.json/);
+  // Old paths must NOT appear (verify the upgrade fully transitioned).
+  assert.equal(/playwright-report\/(smoke|journeys|e2e|a11y|visual)\.json/.test(assets.packageJson), false);
   // qa:e2e should target the critical-journey spec only (no longer duplicates user-journeys)
   assert.match(assets.packageJson, /playwright test tests\/e2e\/critical-journey\.spec\.ts/);
 });

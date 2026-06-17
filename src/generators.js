@@ -832,7 +832,7 @@ function addPlaywright(report, rows, testCases) {
   const passed = cases.filter((test) => test.status === 'passed').length;
   const failed = cases.filter((test) => test.status === 'failed').length;
   const skipped = cases.filter((test) => test.status === 'skipped').length;
-  rows.push({ tool: 'playwright', status: failed ? 'failed' : 'passed', total: cases.length, passed, failed, skipped, coverage: '', source: 'playwright-report/results.json' });
+  rows.push({ tool: 'playwright', status: failed ? 'failed' : 'passed', total: cases.length, passed, failed, skipped, coverage: '', source: 'qa-results/playwright-*.json' });
 }
 
 function addVitest(report, rows) {
@@ -909,7 +909,7 @@ function addVisual(playwrightReport, rows) {
     failed,
     skipped,
     coverage: failed ? failed + ' diff(s)' : '',
-    source: 'playwright-report/results.json (tests/visual)',
+    source: 'qa-results/playwright-visual.json',
   });
 }
 
@@ -1259,18 +1259,35 @@ function buildTrivyQaCases(report, threshold) {
   }
 }
 
-// Each Playwright stage writes its own JSON via PLAYWRIGHT_JSON_OUTPUT_FILE so
-// they don't clobber each other. Merge them all here before parsing.
+// Each Playwright stage writes its own JSON via PLAYWRIGHT_JSON_OUTPUT_FILE
+// into qa-results/ (not playwright-report/, which Playwright's html reporter
+// nukes between stages and would otherwise erase per-stage outputs). Merge
+// them all here before parsing.
 function mergePlaywrightReports() {
-  const reports = readJsonDir('playwright-report');
-  const legacy = readJson('playwright-report/results.json');
-  const all = legacy ? [legacy, ...reports.filter((r) => r !== legacy)] : reports;
+  const stagePaths = [
+    'qa-results/playwright-smoke.json',
+    'qa-results/playwright-journeys.json',
+    'qa-results/playwright-e2e.json',
+    'qa-results/playwright-a11y.json',
+    'qa-results/playwright-visual.json',
+  ];
+  const stageReports = stagePaths.map((rel) => readJson(rel)).filter(Boolean);
+  // Legacy paths: pre-fix repos wrote to playwright-report/<stage>.json and
+  // the original generator wrote a single playwright-report/results.json.
+  // Read both so stale artifacts don't silently disappear.
+  const legacyPaths = [
+    'playwright-report/smoke.json',
+    'playwright-report/journeys.json',
+    'playwright-report/e2e.json',
+    'playwright-report/a11y.json',
+    'playwright-report/visual.json',
+    'playwright-report/results.json',
+  ];
+  const legacyReports = legacyPaths.map((rel) => readJson(rel)).filter(Boolean);
   const merged = { suites: [] };
   const seenSuiteFiles = new Set();
-  for (const r of all) {
+  for (const r of [...stageReports, ...legacyReports]) {
     for (const suite of r?.suites || []) {
-      // Dedupe by suite identifier where possible (file + title) so the legacy
-      // results.json doesn't double-count anything also written per-stage.
       const key = (suite.file || '') + '::' + (suite.title || '');
       if (seenSuiteFiles.has(key)) continue;
       seenSuiteFiles.add(key);
@@ -1390,14 +1407,23 @@ export function generateAssets(scan, plan, options = {}) {
   if (enabled.has("playwright")) {
     const journeys = journeysOverride || discoverUserJourneys(scan.files);
     upgradeScript(pkg.scripts, "qa:smoke",
-      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/smoke.json playwright test tests/smoke",
-      ["playwright test tests/smoke"]);
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results/playwright-smoke.json playwright test tests/smoke",
+      [
+        "playwright test tests/smoke",
+        "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/smoke.json playwright test tests/smoke",
+      ]);
     upgradeScript(pkg.scripts, "qa:e2e",
-      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/e2e.json playwright test tests/e2e/critical-journey.spec.ts",
-      ["playwright test tests/e2e"]);
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results/playwright-e2e.json playwright test tests/e2e/critical-journey.spec.ts",
+      [
+        "playwright test tests/e2e",
+        "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/e2e.json playwright test tests/e2e/critical-journey.spec.ts",
+      ]);
     upgradeScript(pkg.scripts, "qa:journeys",
-      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/journeys.json playwright test tests/e2e/user-journeys.spec.ts",
-      ["playwright test tests/e2e/user-journeys.spec.ts"]);
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results/playwright-journeys.json playwright test tests/e2e/user-journeys.spec.ts",
+      [
+        "playwright test tests/e2e/user-journeys.spec.ts",
+        "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/journeys.json playwright test tests/e2e/user-journeys.spec.ts",
+      ]);
     addDevDependency(deps, "@playwright/test", "^1.56.1");
     if (!scan.facts.hasPlaywrightConfig) files.push({ path: "playwright.config.ts", content: PLAYWRIGHT_CONFIG });
     files.push({ path: "tests/smoke/qa-smoke.spec.ts", content: PLAYWRIGHT_SMOKE });
@@ -1439,8 +1465,11 @@ export function generateAssets(scan, plan, options = {}) {
   if (enabled.has("axe") && enabled.has("playwright")) {
     const journeys = journeysOverride || discoverUserJourneys(scan.files);
     upgradeScript(pkg.scripts, "qa:a11y",
-      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/a11y.json playwright test tests/a11y/qa-a11y.spec.ts",
-      ["playwright test tests/a11y/qa-a11y.spec.ts"]);
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results/playwright-a11y.json playwright test tests/a11y/qa-a11y.spec.ts",
+      [
+        "playwright test tests/a11y/qa-a11y.spec.ts",
+        "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/a11y.json playwright test tests/a11y/qa-a11y.spec.ts",
+      ]);
     addDevDependency(deps, "@axe-core/playwright", "^4.10.1");
     addDevDependency(deps, "axe-core", "^4.10.2");
     files.push({ path: "tests/a11y/qa-a11y.spec.ts", content: createAxeSpec(journeys) });
@@ -1449,11 +1478,17 @@ export function generateAssets(scan, plan, options = {}) {
   if (enabled.has("visual") && enabled.has("playwright")) {
     const journeys = journeysOverride || discoverUserJourneys(scan.files);
     upgradeScript(pkg.scripts, "qa:visual",
-      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/visual.json playwright test tests/visual/qa-visual.spec.ts",
-      ["playwright test tests/visual/qa-visual.spec.ts"]);
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results/playwright-visual.json playwright test tests/visual/qa-visual.spec.ts",
+      [
+        "playwright test tests/visual/qa-visual.spec.ts",
+        "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/visual.json playwright test tests/visual/qa-visual.spec.ts",
+      ]);
     upgradeScript(pkg.scripts, "qa:visual:update",
-      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/visual.json playwright test tests/visual/qa-visual.spec.ts --update-snapshots",
-      ["playwright test tests/visual/qa-visual.spec.ts --update-snapshots"]);
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results/playwright-visual.json playwright test tests/visual/qa-visual.spec.ts --update-snapshots",
+      [
+        "playwright test tests/visual/qa-visual.spec.ts --update-snapshots",
+        "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/visual.json playwright test tests/visual/qa-visual.spec.ts --update-snapshots",
+      ]);
     files.push({ path: "tests/visual/qa-visual.spec.ts", content: createVisualSpec(journeys) });
   }
 
