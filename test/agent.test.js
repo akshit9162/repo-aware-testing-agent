@@ -466,6 +466,87 @@ test("crawler walks same-origin link graph BFS to configured depth", async () =>
   }
 });
 
+test("crawler captures html when captureHtml is set", async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end(`<html><head><title>Live</title></head><body><h1>Hello world</h1></body></html>`);
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const port = server.address().port;
+  try {
+    const withHtml = await crawlSite(`http://127.0.0.1:${port}/`, { depth: 0, captureHtml: true });
+    assert.equal(withHtml.length, 1);
+    assert.match(withHtml[0].html, /Hello world/);
+
+    const noHtml = await crawlSite(`http://127.0.0.1:${port}/`, { depth: 0 });
+    assert.equal(noHtml[0].html, undefined, "html should be absent by default");
+  } finally {
+    server.close();
+  }
+});
+
+test("enrichJourneys prefers journey.html over journey.source and tags the message", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const staticJourneys = discoverUserJourneys(scan.files);
+  // Build a journey that has BOTH source and html — html should win.
+  const target = staticJourneys[0];
+  const journey = { ...target, html: "<html><body><h1>From the live DOM</h1></body></html>" };
+
+  const seen = [];
+  const fakeClient = {
+    messages: {
+      create: async ({ messages }) => {
+        seen.push(messages[0].content);
+        const payload = { description: "ok", expected: [{ kind: "heading", text: "From the live DOM" }] };
+        return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+      },
+    },
+  };
+
+  const { enriched, stats } = await enrichJourneys({
+    repoRoot: dir,
+    journeys: [journey],
+    client: fakeClient,
+  });
+
+  assert.equal(stats.succeeded, 1);
+  assert.equal(enriched.get(journey.path).expected[0].text, "From the live DOM");
+  assert.equal(seen.length, 1);
+  assert.match(seen[0], /Content type: rendered HTML/);
+  assert.match(seen[0], /From the live DOM/);
+});
+
+test("enrichJourneys cache keys differ between source and html kinds", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-cachekey-"));
+  // Lay down a journey source file so the source path is readable.
+  await fs.mkdir(path.join(dir, "app"), { recursive: true });
+  await fs.writeFile(path.join(dir, "app", "page.tsx"), "export default function Page(){return <main/>;}");
+
+  const journeySource = { path: "/", title: "home", source: "app/page.tsx", env: "QA_ROUTE_HOME" };
+  const journeyHtml = { ...journeySource, html: "<html><body>html mode</body></html>" };
+
+  let calls = 0;
+  const fakeClient = {
+    messages: {
+      create: async () => {
+        calls += 1;
+        return { content: [{ type: "text", text: JSON.stringify({ description: "ok", expected: [] }) }] };
+      },
+    },
+  };
+
+  const a = await enrichJourneys({ repoRoot: dir, journeys: [journeySource], client: fakeClient });
+  const b = await enrichJourneys({ repoRoot: dir, journeys: [journeyHtml], client: fakeClient });
+  // Source path makes one API call. HTML path is a different cache key — second
+  // call must also hit the API (not the existing source cache).
+  assert.equal(calls, 2);
+  assert.equal(a.stats.succeeded, 1);
+  assert.equal(b.stats.succeeded, 1);
+  assert.equal(a.stats.cached, 0);
+  assert.equal(b.stats.cached, 0);
+});
+
 test("crawler depth=0 discovers only the entry page", async () => {
   const server = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "text/html" });

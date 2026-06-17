@@ -15,6 +15,7 @@ const DEFAULT_DEPTH = 2;
 const DEFAULT_MAX_PAGES = 100;
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_CONCURRENCY = 4;
+const DEFAULT_MAX_HTML_CHARS = 20_000;
 
 const SKIP_SCHEMES = /^(mailto:|tel:|javascript:|data:|chrome:|about:)/i;
 const ASSET_EXT = /\.(png|jpe?g|gif|svg|ico|webp|avif|css|js|mjs|cjs|json|xml|pdf|zip|woff2?|ttf|otf|mp4|webm|mp3|wav)(\?|#|$)/i;
@@ -96,6 +97,8 @@ export async function crawlSite(baseUrl, {
   maxPages = DEFAULT_MAX_PAGES,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   concurrency = DEFAULT_CONCURRENCY,
+  captureHtml = false,
+  maxHtmlChars = DEFAULT_MAX_HTML_CHARS,
   logger = () => {},
 } = {}) {
   let base;
@@ -139,13 +142,17 @@ export async function crawlSite(baseUrl, {
       if (!path || ASSET_EXT.test(path)) return;
 
       if (!discovered.has(path)) {
-        discovered.set(path, {
+        const record = {
           path,
           title: extractTitle(html),
           source: "crawl",
           dynamic: false,
           foundOn: foundOn || null,
-        });
+        };
+        if (captureHtml) {
+          record.html = html.length > maxHtmlChars ? html.slice(0, maxHtmlChars) : html;
+        }
+        discovered.set(path, record);
         logger(`200 ${finalUrl} -> ${path}`);
       }
 
