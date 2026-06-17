@@ -9,3 +9,4 @@ export { discoverUnitTestTargets } from "./unitDiscovery.js";
 export { discoverApiEndpoints } from "./apiDiscovery.js";
 export { createSonarProperties } from "./sonarDiscovery.js";
 export { createTrivyIgnore, discoverSecurityTargets } from "./securityDiscovery.js";
+export { enrichJourneys } from "./llmEnrich.js";

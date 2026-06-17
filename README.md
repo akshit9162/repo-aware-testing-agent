@@ -6,8 +6,11 @@ A standalone QA automation agent that scans a repository and generates a customi
 - Vitest
 - SonarQube
 - Postman/Newman
-- Trivy
+- Trivy (CVE / dependency / container)
 - k6
+- axe-core (accessibility, via @axe-core/playwright)
+- gitleaks (secret scanning)
+- Semgrep (SAST)
 
 It inspects the target repo, builds a risk-aware test plan, then optionally writes starter configs, test files, Postman collections, k6 scripts, and `package.json` QA scripts.
 
@@ -18,6 +21,60 @@ API tests are generated from detected API route files such as `pages/api/**`, `a
 Security and performance checks are also generated from the scan. The agent writes `.trivyignore` and a `qa:security` script that exports `qa-results/trivy.json`; severity gating is applied by `scripts/qa-run-all.mjs` via `--fail-on` (default `high`). For API repos, it generates a k6 script that load-tests each discovered endpoint with response-time and success-rate thresholds.
 
 Requires `trivy` on PATH (`brew install trivy` on macOS; see https://trivy.dev/ for other platforms).
+
+## LLM journey enrichment (optional)
+
+When `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set during generation, the
+agent calls Claude or GPT once per discovered route to identify the most
+important stable elements on each page (headings, CTAs, links, images)
+and embeds route-specific Playwright assertions into
+`tests/e2e/user-journeys.spec.ts`. When no key is set — or when called
+with `--no-llm` / `QA_LLM=0` — the agent emits the deterministic skeleton
+(page loads, body not empty, exercise visible inputs).
+
+Provider selection:
+
+- Anthropic is preferred when both keys are set. Force one with
+  `QA_LLM_PROVIDER=anthropic` or `QA_LLM_PROVIDER=openai`.
+- Default models: `claude-sonnet-4-6` (Anthropic) /
+  `gpt-4o-mini` (OpenAI). Override either with `QA_LLM_MODEL` (e.g.
+  `QA_LLM_MODEL=claude-opus-4-8` for maximum precision, or
+  `QA_LLM_MODEL=claude-haiku-4-5-20251001` to optimize for cost/latency).
+- Soft dependencies: requires `@anthropic-ai/sdk` or `openai` installed
+  in the target repo (or the agent dir). If the relevant SDK is missing,
+  enrichment is skipped silently and the deterministic path runs.
+
+Behaviour:
+
+- Reads each route's page component (`app/**/page.tsx`, `pages/**/*.tsx`,
+  `src/(pages|routes)/**`), sends source + route to the LLM with a
+  structured-output JSON schema, and only embeds findings it can
+  identify confidently.
+- Concurrency capped at 5 in-flight requests; retries with exponential
+  backoff + jitter on 429/5xx (honors `Retry-After`).
+- Per-route results cached in `.qa-agent-cache/llm-enrich/` keyed by
+  hash(route + source). Subsequent runs hit cache until the page
+  component changes.
+- Failures on a single route fall back to the skeleton path for that
+  route without aborting other routes; the first error surfaces in
+  `enrichment.stats.firstError`.
+
+The CLI output reports an `enrichment` block:
+
+```json
+"enrichment": {
+  "enabled": true,
+  "stats": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "requested": 28,
+    "cached": 21,
+    "succeeded": 49,
+    "failed": 0,
+    "skipped": 0
+  }
+}
+```
 
 ## Usage
 
@@ -56,15 +113,28 @@ Depending on the repo, the agent can add:
   "qa:smoke": "playwright test tests/smoke",
   "qa:journeys": "playwright test tests/e2e/user-journeys.spec.ts",
   "qa:e2e": "playwright test tests/e2e",
-  "qa:unit": "vitest run",
+  "qa:a11y": "playwright test tests/a11y/qa-a11y.spec.ts",
+  "qa:unit": "vitest run tests/unit",
   "qa:api": "newman run postman/qa-collection.json",
-  "qa:security": "grype .",
+  "qa:security": "trivy fs --format json --output qa-results/trivy.json .",
+  "qa:secrets": "gitleaks detect --report-format json --report-path qa-results/gitleaks.json --no-git",
+  "qa:sast": "semgrep --config auto --json --output qa-results/semgrep.json --quiet .",
   "qa:quality": "sonar-scanner",
   "qa:perf": "k6 run tests/performance/load.js",
   "qa:report": "node scripts/qa-report.mjs",
   "qa:all": "node scripts/qa-run-all.mjs"
 }
 ```
+
+External CLI prerequisites (install once, per machine):
+
+- `brew install trivy` — vulnerability scanner
+- `brew install gitleaks` — secret scanner
+- `brew install semgrep` — static analysis
+- `brew install k6` — load testing
+- `brew install sonar-scanner` — Sonar client (only needed if `SONAR_HOST_URL` is set)
+
+The Playwright/Newman/Vitest/axe-core packages are installed automatically as devDependencies when you `npm install`. For the a11y stage specifically, ensure both `@axe-core/playwright` and `axe-core` are present (the agent adds them when the axe stage is enabled).
 
 `qa:all` runs the generated QA stages in order and then writes a consolidated report even if one of the test stages fails. The report outputs:
 

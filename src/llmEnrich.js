@@ -1,0 +1,310 @@
+/**
+ * LLM-backed enrichment for Playwright journey specs.
+ *
+ * For each journey route, reads the page component source and asks an LLM
+ * (Claude or GPT) to identify the most important visible, stable elements
+ * that a basic smoke test should assert. Returns a Map<route, enrichment>:
+ *   { description: string,
+ *     expected: Array<{kind: 'heading'|'text'|'link'|'button'|'image',
+ *                      text?: string, name?: string, level?: 1-6}> }
+ *
+ * Activates when ANTHROPIC_API_KEY or OPENAI_API_KEY is set. Override the
+ * provider with QA_LLM_PROVIDER=anthropic|openai when both are present.
+ * Cache writes go to .qa-agent-cache/llm-enrich/ keyed by hash(route+source).
+ * Failures fall back silently so the orchestrator can always proceed with
+ * the skeleton path. Retries with backoff on 429/5xx.
+ */
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+
+const DEFAULT_MODELS = {
+  anthropic: "claude-sonnet-4-6",
+  openai: "gpt-4o-mini",
+};
+const MAX_SOURCE_CHARS = 6000;
+const CONCURRENCY = 5;
+const CACHE_DIR = ".qa-agent-cache/llm-enrich";
+
+const SYSTEM_PROMPT = `You are a QA test designer. Given a web page component's source code and its route path, identify the most important visible, stable elements that a basic browser smoke test should assert.
+
+Rules:
+- Return up to 6 expectations per page; fewer is better than wrong.
+- Be conservative: only include elements you can identify confidently from the source.
+- Prefer accessibility-friendly identifiers (role + accessible name) over CSS selectors.
+- For headings, capture the visible text or a short phrase from it. Skip if the text is dynamic/templated (e.g. interpolated from a fetch).
+- For links and buttons, capture the visible label (the "accessible name").
+- Avoid loaded/dynamic content (data fetched from APIs, slug-templated text); prefer static markup.
+- Visible elements present in the source will exist in the DOM after the page renders.`;
+
+const SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["description", "expected"],
+  properties: {
+    description: { type: "string", description: "One-sentence summary of what this smoke test verifies." },
+    expected: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["kind"],
+        properties: {
+          kind: { enum: ["heading", "text", "link", "button", "image"] },
+          text: { type: "string", description: "Visible text or short phrase (for heading/text)." },
+          name: { type: "string", description: "Accessible name (for link/button)." },
+          level: { type: "integer", description: "Heading level 1-6 when known." },
+        },
+      },
+    },
+  },
+};
+
+function hashKey(route, source) {
+  return crypto.createHash("sha1").update(route + "::" + source).digest("hex");
+}
+
+async function readCached(repoRoot, key) {
+  try {
+    return JSON.parse(await fs.readFile(path.join(repoRoot, CACHE_DIR, key + ".json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function writeCached(repoRoot, key, value) {
+  try {
+    const dir = path.join(repoRoot, CACHE_DIR);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, key + ".json"), JSON.stringify(value, null, 2), "utf8");
+  } catch {}
+}
+
+function detectProviderFromClient(client) {
+  if (client?.chat?.completions?.create) return "openai";
+  if (client?.messages?.create) return "anthropic";
+  return null;
+}
+
+function resolveProvider({ provider, anthropicKey, openaiKey } = {}) {
+  if (provider) return provider.toLowerCase();
+  const fromEnv = (process.env.QA_LLM_PROVIDER || "").toLowerCase();
+  if (fromEnv === "anthropic" || fromEnv === "openai") return fromEnv;
+  if (anthropicKey) return "anthropic";
+  if (openaiKey) return "openai";
+  return null;
+}
+
+function buildUserMessage(journey, source) {
+  const truncated = source.slice(0, MAX_SOURCE_CHARS);
+  return `Route: ${journey.path}
+Source file: ${journey.source}
+
+\`\`\`
+${truncated}${source.length > MAX_SOURCE_CHARS ? "\n... [truncated]" : ""}
+\`\`\`
+
+Identify the stable, visible elements that a basic smoke test should assert.`;
+}
+
+async function enrichOneAnthropic(client, journey, source, model) {
+  const response = await client.messages.create({
+    model,
+    max_tokens: 1500,
+    system: SYSTEM_PROMPT,
+    output_config: { format: { type: "json_schema", schema: SCHEMA } },
+    messages: [{ role: "user", content: buildUserMessage(journey, source) }],
+  });
+  const text = response.content?.find?.((b) => b.type === "text")?.text;
+  if (!text) throw new Error("no text in response");
+  return JSON.parse(text);
+}
+
+async function enrichOneOpenAI(client, journey, source, model) {
+  const response = await client.chat.completions.create({
+    model,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: buildUserMessage(journey, source) },
+    ],
+    response_format: {
+      type: "json_schema",
+      json_schema: { name: "page_smoke_assertions", strict: false, schema: SCHEMA },
+    },
+  });
+  const text = response.choices?.[0]?.message?.content;
+  if (!text) throw new Error("no text in response");
+  return JSON.parse(text);
+}
+
+async function enrichOne(client, journey, source, model, provider) {
+  if (provider === "openai") return enrichOneOpenAI(client, journey, source, model);
+  return enrichOneAnthropic(client, journey, source, model);
+}
+
+function parseStatus(error) {
+  if (typeof error?.status === "number") return error.status;
+  const match = /^(\d{3})\b/.exec(String(error?.message || ""));
+  return match ? Number(match[1]) : 0;
+}
+
+function parseRetryAfterMs(error) {
+  const headers = error?.headers;
+  const get = typeof headers?.get === "function" ? (k) => headers.get(k) : (k) => headers?.[k];
+  const v = Number(get?.("retry-after") || get?.("Retry-After") || 0);
+  return Number.isFinite(v) && v > 0 ? v * 1000 : 0;
+}
+
+async function enrichOneWithRetry(client, journey, source, model, provider, maxRetries = 5) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await enrichOne(client, journey, source, model, provider);
+    } catch (error) {
+      const status = parseStatus(error);
+      const retryable = status === 429 || status === 529 || status >= 500;
+      if (!retryable || attempt >= maxRetries) throw error;
+      attempt += 1;
+      const retryAfterMs = parseRetryAfterMs(error);
+      const backoffMs = Math.min(2 ** attempt * 1000, 60_000);
+      const jitter = Math.floor(Math.random() * 500);
+      await new Promise((resolve) => setTimeout(resolve, (retryAfterMs || backoffMs) + jitter));
+    }
+  }
+}
+
+async function withSemaphore(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      try {
+        results[idx] = await worker(items[idx], idx);
+      } catch (error) {
+        results[idx] = { error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+async function importClient(provider, apiKey, logger) {
+  const sdkName = provider === "openai" ? "openai" : "@anthropic-ai/sdk";
+  try {
+    const mod = await import(sdkName);
+    const Ctor = mod.default || mod;
+    return new Ctor({ apiKey });
+  } catch (error) {
+    logger(`LLM enrichment disabled: ${sdkName} not installed`);
+    return null;
+  }
+}
+
+/**
+ * Build per-route enrichment via Claude or OpenAI. Returns
+ *   { enriched: Map<route, enrichment>,
+ *     stats: { provider, model, requested, cached, succeeded, failed, skipped, firstError? } }
+ *
+ * Caller may inject `{ client }` in tests to bypass SDK imports. Provider
+ * is detected from the client shape, or from QA_LLM_PROVIDER / available
+ * API keys when constructing one fresh.
+ */
+export async function enrichJourneys({ repoRoot, journeys, apiKey, anthropicApiKey, openaiApiKey, provider: providerOverride, model: modelOverride, client: injectedClient, logger = () => {} } = {}) {
+  const baseStats = { provider: null, model: null, requested: 0, cached: 0, succeeded: 0, failed: 0, skipped: journeys?.length || 0 };
+  const empty = () => ({ enriched: new Map(), stats: { ...baseStats } });
+  if (!journeys || !journeys.length) return empty();
+
+  // Resolve provider — from explicit override, env, injected client, or key presence.
+  let provider = providerOverride || (injectedClient && detectProviderFromClient(injectedClient));
+  if (!provider) {
+    provider = resolveProvider({
+      anthropicKey: anthropicApiKey || process.env.ANTHROPIC_API_KEY,
+      openaiKey: openaiApiKey || process.env.OPENAI_API_KEY,
+    });
+  }
+
+  // No provider configured — fall back to cache-only mode so prior enrichments
+  // aren't lost across runs that happen to lack an API key.
+  if (!provider) {
+    const enriched = new Map();
+    const stats = { ...baseStats, provider: "cache-only", model: null };
+    for (const journey of journeys) {
+      if (!journey.source) continue;
+      try {
+        const source = await fs.readFile(path.join(repoRoot, journey.source), "utf8");
+        const cached = await readCached(repoRoot, hashKey(journey.path, source));
+        if (cached) {
+          enriched.set(journey.path, cached);
+          stats.cached += 1;
+          stats.succeeded += 1;
+        }
+      } catch {
+        // ignore — falls through to skeleton path
+      }
+    }
+    stats.skipped = journeys.length - stats.succeeded;
+    return { enriched, stats };
+  }
+
+  const model = modelOverride || process.env.QA_LLM_MODEL || DEFAULT_MODELS[provider];
+
+  let client = injectedClient;
+  if (!client) {
+    const resolvedKey = apiKey
+      || (provider === "anthropic" ? (anthropicApiKey || process.env.ANTHROPIC_API_KEY) : (openaiApiKey || process.env.OPENAI_API_KEY));
+    if (!resolvedKey) {
+      return { enriched: new Map(), stats: { ...baseStats, provider, model } };
+    }
+    client = await importClient(provider, resolvedKey, logger);
+    if (!client) {
+      return { enriched: new Map(), stats: { ...baseStats, provider, model, error: "sdk not installed" } };
+    }
+  }
+
+  const inputs = [];
+  for (const journey of journeys) {
+    if (!journey.source) continue;
+    try {
+      const source = await fs.readFile(path.join(repoRoot, journey.source), "utf8");
+      inputs.push({ journey, source, key: hashKey(journey.path, source) });
+    } catch {
+      // source file missing — skip this journey
+    }
+  }
+
+  const stats = { ...baseStats, provider, model, skipped: journeys.length - inputs.length };
+  const enriched = new Map();
+
+  const results = await withSemaphore(inputs, CONCURRENCY, async (input) => {
+    const cached = await readCached(repoRoot, input.key);
+    if (cached) {
+      stats.cached += 1;
+      return { route: input.journey.path, value: cached };
+    }
+    stats.requested += 1;
+    const value = await enrichOneWithRetry(client, input.journey, input.source, model, provider);
+    await writeCached(repoRoot, input.key, value);
+    return { route: input.journey.path, value };
+  });
+
+  let firstError = null;
+  for (const result of results) {
+    if (result?.error) {
+      stats.failed += 1;
+      if (!firstError) firstError = result.error;
+      continue;
+    }
+    if (result?.route && result?.value) {
+      enriched.set(result.route, result.value);
+      stats.succeeded += 1;
+    }
+  }
+  if (firstError) {
+    stats.firstError = firstError;
+    logger("first enrichment error: " + firstError);
+  }
+
+  return { enriched, stats };
+}

@@ -24,5 +24,9 @@
   "engines": {
     "node": ">=18"
   },
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "optionalDependencies": {
+    "@anthropic-ai/sdk": "^0.104.2",
+    "openai": "^6.42.0"
+  }
 }
