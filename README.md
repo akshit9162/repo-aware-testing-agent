@@ -1,5 +1,7 @@
 # Repo-Aware Testing Agent
 
+> **New to this?** See [WALKTHROUGH.md](./WALKTHROUGH.md) for a clone-and-run guide that gets you from a fresh repo to a QA report in under 10 minutes.
+
 A standalone QA automation agent that scans a repository and generates a customized testing workflow for:
 
 - Playwright
