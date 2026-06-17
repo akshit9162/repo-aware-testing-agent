@@ -10,3 +10,5 @@ export { discoverApiEndpoints } from "./apiDiscovery.js";
 export { createSonarProperties } from "./sonarDiscovery.js";
 export { createTrivyIgnore, discoverSecurityTargets } from "./securityDiscovery.js";
 export { enrichJourneys } from "./llmEnrich.js";
+export { crawlSite, mergeJourneys } from "./crawler.js";
+export { importHar } from "./harImport.js";

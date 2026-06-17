@@ -11,6 +11,7 @@ A standalone QA automation agent that scans a repository and generates a customi
 - axe-core (accessibility, via @axe-core/playwright)
 - gitleaks (secret scanning)
 - Semgrep (SAST)
+- Visual regression (Playwright `toHaveScreenshot()` baselines)
 
 It inspects the target repo, builds a risk-aware test plan, then optionally writes starter configs, test files, Postman collections, k6 scripts, and `package.json` QA scripts.
 
@@ -96,6 +97,30 @@ Choose an output plan path:
 node src/cli.js /path/to/repo --plan qa-plan.json
 ```
 
+Discover routes by crawling a live deployment (server-rendered links only):
+
+```sh
+node src/cli.js crawl https://example.com --depth 2 --max 50 --out crawled.json
+```
+
+Each entry is a `{ path, title, source: 'crawl', dynamic, foundOn }` record
+compatible with the journeys pipeline. Use it to catch dynamic routes the
+static scan misses (CMS slugs, feature-flagged pages, redirects). The crawler
+uses plain HTTP fetch — SPAs that surface routes only after client-side
+hydration won't be fully covered.
+
+Import a HAR file (Chrome DevTools → Network → save as HAR) into a Postman
+collection:
+
+```sh
+node src/cli.js har session.har --out postman/qa-collection.json
+node src/cli.js har session.har --replace --filter-origin https://api.example.com
+```
+
+Default merges into the existing collection, deduping by `method + URL`.
+`--replace` discards prior entries; `--filter-origin` keeps only requests
+to the named origin (useful for excluding third-party tracking calls).
+
 Generate an Excel-compatible Playwright report workbook:
 
 ```sh
@@ -114,6 +139,8 @@ Depending on the repo, the agent can add:
   "qa:journeys": "playwright test tests/e2e/user-journeys.spec.ts",
   "qa:e2e": "playwright test tests/e2e",
   "qa:a11y": "playwright test tests/a11y/qa-a11y.spec.ts",
+  "qa:visual": "playwright test tests/visual/qa-visual.spec.ts",
+  "qa:visual:update": "playwright test tests/visual --update-snapshots",
   "qa:unit": "vitest run tests/unit",
   "qa:api": "newman run postman/qa-collection.json",
   "qa:security": "trivy fs --format json --output qa-results/trivy.json .",
