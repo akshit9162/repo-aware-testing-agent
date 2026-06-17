@@ -60,8 +60,8 @@ const SCHEMA = {
   },
 };
 
-function hashKey(route, source) {
-  return crypto.createHash("sha1").update(route + "::" + source).digest("hex");
+function hashKey(route, content, kind) {
+  return crypto.createHash("sha1").update(kind + "::" + route + "::" + content).digest("hex");
 }
 
 async function readCached(repoRoot, key) {
@@ -95,37 +95,50 @@ function resolveProvider({ provider, anthropicKey, openaiKey } = {}) {
   return null;
 }
 
-function buildUserMessage(journey, source) {
-  const truncated = source.slice(0, MAX_SOURCE_CHARS);
+function buildUserMessage(journey, content, kind) {
+  const truncated = content.slice(0, MAX_SOURCE_CHARS);
+  const tail = content.length > MAX_SOURCE_CHARS ? "\n... [truncated]" : "";
+  if (kind === "rendered-html") {
+    return `Route: ${journey.path}
+Content type: rendered HTML (live capture, post-render)
+Source URL: ${journey.foundOn ? "linked from " + journey.foundOn : "entry"}
+
+\`\`\`html
+${truncated}${tail}
+\`\`\`
+
+This is the *rendered* HTML the browser saw, not source code. Identify the stable, visible elements a basic smoke test should assert. Headings, links, and buttons will appear as real DOM elements with their final text.`;
+  }
   return `Route: ${journey.path}
+Content type: component source code
 Source file: ${journey.source}
 
 \`\`\`
-${truncated}${source.length > MAX_SOURCE_CHARS ? "\n... [truncated]" : ""}
+${truncated}${tail}
 \`\`\`
 
 Identify the stable, visible elements that a basic smoke test should assert.`;
 }
 
-async function enrichOneAnthropic(client, journey, source, model) {
+async function enrichOneAnthropic(client, journey, content, kind, model) {
   const response = await client.messages.create({
     model,
     max_tokens: 1500,
     system: SYSTEM_PROMPT,
     output_config: { format: { type: "json_schema", schema: SCHEMA } },
-    messages: [{ role: "user", content: buildUserMessage(journey, source) }],
+    messages: [{ role: "user", content: buildUserMessage(journey, content, kind) }],
   });
   const text = response.content?.find?.((b) => b.type === "text")?.text;
   if (!text) throw new Error("no text in response");
   return JSON.parse(text);
 }
 
-async function enrichOneOpenAI(client, journey, source, model) {
+async function enrichOneOpenAI(client, journey, content, kind, model) {
   const response = await client.chat.completions.create({
     model,
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: buildUserMessage(journey, source) },
+      { role: "user", content: buildUserMessage(journey, content, kind) },
     ],
     response_format: {
       type: "json_schema",
@@ -137,9 +150,9 @@ async function enrichOneOpenAI(client, journey, source, model) {
   return JSON.parse(text);
 }
 
-async function enrichOne(client, journey, source, model, provider) {
-  if (provider === "openai") return enrichOneOpenAI(client, journey, source, model);
-  return enrichOneAnthropic(client, journey, source, model);
+async function enrichOne(client, journey, content, kind, model, provider) {
+  if (provider === "openai") return enrichOneOpenAI(client, journey, content, kind, model);
+  return enrichOneAnthropic(client, journey, content, kind, model);
 }
 
 function parseStatus(error) {
@@ -155,11 +168,11 @@ function parseRetryAfterMs(error) {
   return Number.isFinite(v) && v > 0 ? v * 1000 : 0;
 }
 
-async function enrichOneWithRetry(client, journey, source, model, provider, maxRetries = 5) {
+async function enrichOneWithRetry(client, journey, content, kind, model, provider, maxRetries = 5) {
   let attempt = 0;
   while (true) {
     try {
-      return await enrichOne(client, journey, source, model, provider);
+      return await enrichOne(client, journey, content, kind, model, provider);
     } catch (error) {
       const status = parseStatus(error);
       const retryable = status === 429 || status === 529 || status >= 500;
@@ -188,6 +201,21 @@ async function withSemaphore(items, limit, worker) {
   });
   await Promise.all(runners);
   return results;
+}
+
+async function resolveJourneyContent(journey, repoRoot) {
+  if (typeof journey.html === "string" && journey.html.length) {
+    return { content: journey.html, kind: "rendered-html" };
+  }
+  if (journey.source) {
+    try {
+      const content = await fs.readFile(path.join(repoRoot, journey.source), "utf8");
+      return { content, kind: "source" };
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 async function importClient(provider, apiKey, logger) {
@@ -231,17 +259,13 @@ export async function enrichJourneys({ repoRoot, journeys, apiKey, anthropicApiK
     const enriched = new Map();
     const stats = { ...baseStats, provider: "cache-only", model: null };
     for (const journey of journeys) {
-      if (!journey.source) continue;
-      try {
-        const source = await fs.readFile(path.join(repoRoot, journey.source), "utf8");
-        const cached = await readCached(repoRoot, hashKey(journey.path, source));
-        if (cached) {
-          enriched.set(journey.path, cached);
-          stats.cached += 1;
-          stats.succeeded += 1;
-        }
-      } catch {
-        // ignore — falls through to skeleton path
+      const resolved = await resolveJourneyContent(journey, repoRoot);
+      if (!resolved) continue;
+      const cached = await readCached(repoRoot, hashKey(journey.path, resolved.content, resolved.kind));
+      if (cached) {
+        enriched.set(journey.path, cached);
+        stats.cached += 1;
+        stats.succeeded += 1;
       }
     }
     stats.skipped = journeys.length - stats.succeeded;
@@ -265,13 +289,14 @@ export async function enrichJourneys({ repoRoot, journeys, apiKey, anthropicApiK
 
   const inputs = [];
   for (const journey of journeys) {
-    if (!journey.source) continue;
-    try {
-      const source = await fs.readFile(path.join(repoRoot, journey.source), "utf8");
-      inputs.push({ journey, source, key: hashKey(journey.path, source) });
-    } catch {
-      // source file missing — skip this journey
-    }
+    const resolved = await resolveJourneyContent(journey, repoRoot);
+    if (!resolved) continue;
+    inputs.push({
+      journey,
+      content: resolved.content,
+      kind: resolved.kind,
+      key: hashKey(journey.path, resolved.content, resolved.kind),
+    });
   }
 
   const stats = { ...baseStats, provider, model, skipped: journeys.length - inputs.length };
@@ -284,7 +309,7 @@ export async function enrichJourneys({ repoRoot, journeys, apiKey, anthropicApiK
       return { route: input.journey.path, value: cached };
     }
     stats.requested += 1;
-    const value = await enrichOneWithRetry(client, input.journey, input.source, model, provider);
+    const value = await enrichOneWithRetry(client, input.journey, input.content, input.kind, model, provider);
     await writeCached(repoRoot, input.key, value);
     return { route: input.journey.path, value };
   });

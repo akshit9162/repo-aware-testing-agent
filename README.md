@@ -51,6 +51,13 @@ Behaviour:
   `src/(pages|routes)/**`), sends source + route to the LLM with a
   structured-output JSON schema, and only embeds findings it can
   identify confidently.
+- **Live-DOM mode:** pass `--crawl-url <baseUrl>` to the main command and
+  the agent crawls the live deployment, merges discovered routes with the
+  static scan, and sends the *rendered HTML* (not source) to the LLM.
+  Assertions match what users actually see post-hydration: real text from
+  CMS slugs, feature-flagged content, and conditionally-rendered CTAs.
+  Cache keys are scoped per content kind so the source cache and the
+  rendered-html cache don't collide.
 - Concurrency capped at 5 in-flight requests; retries with exponential
   backoff + jitter on 429/5xx (honors `Retry-After`).
 - Per-route results cached in `.qa-agent-cache/llm-enrich/` keyed by
@@ -97,7 +104,20 @@ Choose an output plan path:
 node src/cli.js /path/to/repo --plan qa-plan.json
 ```
 
-Discover routes by crawling a live deployment (server-rendered links only):
+Generate route-specific assertions from the live DOM (one command):
+
+```sh
+ANTHROPIC_API_KEY=sk-ant-... \
+  node src/cli.js /path/to/repo --crawl-url https://staging.example.com --write
+```
+
+Crawls the staging deployment, merges discovered routes with the static
+scan, sends the rendered HTML for each new route to Claude, and writes
+`tests/e2e/user-journeys.spec.ts` with DOM-aware assertions. Routes that
+the static scan found keep their source-based enrichment (cache key
+differs between source and HTML modes, so prior work isn't lost).
+
+Discover routes only (no generation, useful for ad-hoc inspection):
 
 ```sh
 node src/cli.js crawl https://example.com --depth 2 --max 50 --out crawled.json

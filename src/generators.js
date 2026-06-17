@@ -1325,6 +1325,7 @@ export function generateAssets(scan, plan, options = {}) {
 
   const enabled = new Set(plan.enabledTools || []);
   const enrichment = options.enrichment instanceof Map ? options.enrichment : new Map();
+  const journeysOverride = Array.isArray(options.journeys) ? options.journeys : null;
   const files = [];
   const deps = pkg.devDependencies;
   const qaOrder = plan.recommendedOrder.filter((script) => script !== "qa:all" && script !== "qa:report");
@@ -1332,7 +1333,7 @@ export function generateAssets(scan, plan, options = {}) {
   addScript(pkg.scripts, "qa:prepare", "node -e \"require('fs').mkdirSync('qa-results',{recursive:true})\"");
 
   if (enabled.has("playwright")) {
-    const journeys = discoverUserJourneys(scan.files);
+    const journeys = journeysOverride || discoverUserJourneys(scan.files);
     addScript(pkg.scripts, "qa:smoke", "playwright test tests/smoke");
     addScript(pkg.scripts, "qa:e2e", "playwright test tests/e2e");
     addScript(pkg.scripts, "qa:journeys", "playwright test tests/e2e/user-journeys.spec.ts");
@@ -1375,7 +1376,7 @@ export function generateAssets(scan, plan, options = {}) {
   }
 
   if (enabled.has("axe") && enabled.has("playwright")) {
-    const journeys = discoverUserJourneys(scan.files);
+    const journeys = journeysOverride || discoverUserJourneys(scan.files);
     addScript(pkg.scripts, "qa:a11y", "playwright test tests/a11y/qa-a11y.spec.ts");
     addDevDependency(deps, "@axe-core/playwright", "^4.10.1");
     addDevDependency(deps, "axe-core", "^4.10.2");
@@ -1383,7 +1384,7 @@ export function generateAssets(scan, plan, options = {}) {
   }
 
   if (enabled.has("visual") && enabled.has("playwright")) {
-    const journeys = discoverUserJourneys(scan.files);
+    const journeys = journeysOverride || discoverUserJourneys(scan.files);
     addScript(pkg.scripts, "qa:visual", "playwright test tests/visual/qa-visual.spec.ts");
     addScript(pkg.scripts, "qa:visual:update", "playwright test tests/visual/qa-visual.spec.ts --update-snapshots");
     files.push({ path: "tests/visual/qa-visual.spec.ts", content: createVisualSpec(journeys) });

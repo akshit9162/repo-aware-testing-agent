@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, importHar } from "./index.js";
+import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, mergeJourneys, importHar } from "./index.js";
 import { writePlaywrightCoverageExcel } from "./playwrightExcel.js";
 
 const KNOWN_TOOLS = ["playwright", "vitest", "sonarqube", "postman", "trivy", "k6", "axe", "gitleaks", "semgrep", "visual"];
@@ -32,6 +32,11 @@ Options:
   --skip <tools>       Comma-separated list of tools to skip
   --plan <path>        Also write the plan JSON to this path
   --no-llm             Disable LLM journey enrichment (also: QA_LLM=0)
+  --crawl-url <url>    Crawl a live deployment, merge discovered routes with
+                       the static-scan journeys, and use the captured HTML as
+                       the LLM enrichment input (instead of source code).
+  --crawl-depth N      BFS depth for --crawl-url (default 2)
+  --crawl-max N        Max pages for --crawl-url (default 100)
   --help, -h           Show this help
 
 LLM enrichment:
@@ -66,6 +71,9 @@ function parseArgs(argv) {
     skip: [],
     planPath: null,
     llm: process.env.QA_LLM !== "0",
+    crawlUrl: null,
+    crawlDepth: 2,
+    crawlMax: 100,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -81,6 +89,15 @@ function parseArgs(argv) {
       i += 1;
     } else if (arg === "--plan") {
       args.planPath = argv[i + 1];
+      i += 1;
+    } else if (arg === "--crawl-url") {
+      args.crawlUrl = argv[i + 1];
+      i += 1;
+    } else if (arg === "--crawl-depth") {
+      args.crawlDepth = Number(argv[i + 1]);
+      i += 1;
+    } else if (arg === "--crawl-max") {
+      args.crawlMax = Number(argv[i + 1]);
       i += 1;
     } else if (arg === "--help" || arg === "-h") {
       args.help = true;
@@ -188,13 +205,34 @@ async function main() {
   const stack = detectStack(scan);
   const plan = createTestPlan(scan, stack, { only: args.only, skip: args.skip });
 
+  // Static journey discovery. May be augmented with live-crawled routes below.
+  let journeys = discoverUserJourneys(scan.files);
+  let crawlStats = null;
+
+  if (args.crawlUrl && plan.enabledTools.includes("playwright")) {
+    const crawled = await crawlSite(args.crawlUrl, {
+      depth: args.crawlDepth,
+      maxPages: args.crawlMax,
+      captureHtml: true,
+      logger: (msg) => process.stderr.write("[crawl] " + msg + "\n"),
+    });
+    const before = journeys.length;
+    journeys = mergeJourneys(journeys, crawled);
+    crawlStats = {
+      baseUrl: args.crawlUrl,
+      depth: args.crawlDepth,
+      crawled: crawled.length,
+      newRoutes: journeys.length - before,
+      total: journeys.length,
+    };
+  }
+
   let enrichmentStats = { provider: null, model: null, requested: 0, cached: 0, succeeded: 0, failed: 0, skipped: 0 };
   let enrichmentMap = new Map();
   // Always invoke when Playwright is enabled — enrichJourneys falls back to
   // cache-only mode when no API key is present, preserving prior enrichments.
   const llmEligible = args.llm && plan.enabledTools.includes("playwright");
   if (llmEligible) {
-    const journeys = discoverUserJourneys(scan.files);
     const result = await enrichJourneys({
       repoRoot: scan.root,
       journeys,
@@ -207,7 +245,7 @@ async function main() {
     enrichmentStats = result.stats;
   }
 
-  const assets = generateAssets(scan, plan, { enrichment: enrichmentMap });
+  const assets = generateAssets(scan, plan, { enrichment: enrichmentMap, journeys });
   const planPath = args.planPath ? path.resolve(args.repoPath, args.planPath) : null;
 
   if (planPath) {
@@ -226,6 +264,7 @@ async function main() {
       enabled: Boolean(llmEligible),
       stats: enrichmentStats,
     },
+    crawl: crawlStats,
   };
 
   if (args.write) {
