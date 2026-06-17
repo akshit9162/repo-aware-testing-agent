@@ -1,4 +1,9 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 const API_FILE_RE = /\.(js|jsx|ts|tsx)$/;
+const APP_ROUTE_RE = /^app\/api\/.*\/route\.(ts|js)$/;
+const METHOD_ORDER = ["POST", "PUT", "PATCH", "DELETE", "GET"];
 
 function cleanSegment(segment) {
   if (!segment || segment === "route" || segment === "index") return "";
@@ -39,19 +44,39 @@ function envNameForEndpoint(path) {
   return `QA_API_${name || "ROOT"}`;
 }
 
-export function discoverApiEndpoints(files) {
+function detectMethodFromAppRouter(repoRoot, file) {
+  try {
+    const content = readFileSync(path.join(repoRoot, file), "utf8");
+    for (const method of METHOD_ORDER) {
+      const re = new RegExp(`export\\s+(async\\s+)?(function|const|let|var)\\s+${method}\\b`);
+      if (re.test(content)) return method;
+    }
+  } catch {
+    // ignore — fall back to GET
+  }
+  return "GET";
+}
+
+export function discoverApiEndpoints(files, options = {}) {
+  const repoRoot = options.repoRoot;
   const endpoints = new Map();
 
   for (const file of files) {
-    const path = fromPagesApi(file) || fromAppApi(file) || fromSrcApi(file);
-    if (!path) continue;
-    endpoints.set(path, {
-      name: nameFromPath(path),
-      method: "GET",
-      path,
-      env: envNameForEndpoint(path),
+    const routePath = fromPagesApi(file) || fromAppApi(file) || fromSrcApi(file);
+    if (!routePath) continue;
+
+    let method = "GET";
+    if (repoRoot && APP_ROUTE_RE.test(file)) {
+      method = detectMethodFromAppRouter(repoRoot, file);
+    }
+
+    endpoints.set(routePath, {
+      name: nameFromPath(routePath),
+      method,
+      path: routePath,
+      env: envNameForEndpoint(routePath),
       source: file,
-      dynamic: path.includes("sample"),
+      dynamic: routePath.includes("sample"),
     });
   }
 

@@ -605,6 +605,41 @@ test("importHar merges entries into postman collection with dedup", async () => 
   assert.equal(post.request.body.raw, "{\"sku\":\"x\"}");
 });
 
+test("apiDiscovery detects POST from app router route exports", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-method-"));
+  await fs.mkdir(path.join(dir, "app", "api", "submit"), { recursive: true });
+  await fs.mkdir(path.join(dir, "app", "api", "health"), { recursive: true });
+  await fs.writeFile(path.join(dir, "app", "api", "submit", "route.ts"),
+    "export async function POST(req: Request) { return new Response('ok'); }");
+  await fs.writeFile(path.join(dir, "app", "api", "health", "route.ts"),
+    "export async function GET() { return new Response('ok'); }");
+
+  const files = ["app/api/submit/route.ts", "app/api/health/route.ts"];
+  const endpoints = discoverApiEndpoints(files, { repoRoot: dir });
+  const submit = endpoints.find((e) => e.path === "/api/submit");
+  const health = endpoints.find((e) => e.path === "/api/health");
+  assert.equal(submit.method, "POST");
+  assert.equal(health.method, "GET");
+
+  // No repoRoot → defaults to GET for everything (backward compatible)
+  const legacy = discoverApiEndpoints(files);
+  assert.equal(legacy.find((e) => e.path === "/api/submit").method, "GET");
+});
+
+test("buildPlaywrightQaCases skips visual specs to avoid double-counting", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const assets = generateAssets(scan, createTestPlan(scan, detectStack(scan)));
+  // Verify the qa scripts include per-stage PLAYWRIGHT_JSON_OUTPUT_FILE env vars
+  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report\/smoke\.json/);
+  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report\/journeys\.json/);
+  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report\/e2e\.json/);
+  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report\/a11y\.json/);
+  assert.match(assets.packageJson, /PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report\/visual\.json/);
+  // qa:e2e should target the critical-journey spec only (no longer duplicates user-journeys)
+  assert.match(assets.packageJson, /playwright test tests\/e2e\/critical-journey\.spec\.ts/);
+});
+
 test("Next.js fixture scaffolds visual stage with screenshot spec", async () => {
   const dir = await makeFixture();
   const scan = await scanRepository(dir);

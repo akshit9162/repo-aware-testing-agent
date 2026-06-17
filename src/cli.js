@@ -269,9 +269,19 @@ async function main() {
 
   if (args.write) {
     result.apply = await applyAssets(scan.root, assets, { overwrite: args.overwrite });
+    const wrotePackage = result.apply.written.includes("package.json");
+    if (wrotePackage) {
+      result.nextSteps = [
+        "npm install     # fetch newly-added devDependencies",
+        "npm run qa:all  # run the full pipeline",
+      ];
+    }
   }
 
   console.log(JSON.stringify(result, null, 2));
+  if (args.write && result.apply?.written.includes("package.json")) {
+    process.stderr.write("\n[qa-agent] package.json updated. Run `npm install` to fetch new devDependencies before `npm run qa:all`.\n");
+  }
 }
 
 main().catch((error) => {

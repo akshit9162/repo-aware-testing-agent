@@ -1011,6 +1011,9 @@ function pageFromPlaywright(testCase) {
 
 function buildPlaywrightQaCases(testCases) {
   for (const tc of testCases) {
+    // Visual tests are surfaced as QA-VIS cases; skip them here to avoid
+    // double-counting in the QA Test Cases sheet.
+    if (/tests\\/visual\\//.test(tc.file || '') || (tc.title || '').includes('visual:')) continue;
     const { type, priority } = playwrightType(tc.file);
     qaCases.push({
       testCaseId: nextId('QA-PW'),
@@ -1236,13 +1239,35 @@ function buildTrivyQaCases(report, threshold) {
   }
 }
 
+// Each Playwright stage writes its own JSON via PLAYWRIGHT_JSON_OUTPUT_FILE so
+// they don't clobber each other. Merge them all here before parsing.
+function mergePlaywrightReports() {
+  const reports = readJsonDir('playwright-report');
+  const legacy = readJson('playwright-report/results.json');
+  const all = legacy ? [legacy, ...reports.filter((r) => r !== legacy)] : reports;
+  const merged = { suites: [] };
+  const seenSuiteFiles = new Set();
+  for (const r of all) {
+    for (const suite of r?.suites || []) {
+      // Dedupe by suite identifier where possible (file + title) so the legacy
+      // results.json doesn't double-count anything also written per-stage.
+      const key = (suite.file || '') + '::' + (suite.title || '');
+      if (seenSuiteFiles.has(key)) continue;
+      seenSuiteFiles.add(key);
+      merged.suites.push(suite);
+    }
+  }
+  return merged.suites.length ? merged : null;
+}
+
 const rows = [];
 const testCases = [];
-addPlaywright(readJson('playwright-report/results.json'), rows, testCases);
+const mergedPlaywright = mergePlaywrightReports();
+addPlaywright(mergedPlaywright, rows, testCases);
 addVitest(readJson('qa-results/vitest.json'), rows);
 addNewman(readJson('qa-results/newman.json'), rows);
 addK6(readJson('qa-results/k6-summary.json'), rows);
-addVisual(readJson('playwright-report/results.json'), rows);
+addVisual(mergedPlaywright, rows);
 addAxe(readJsonDir('qa-results/axe'), rows);
 addGitleaks(readJson('qa-results/gitleaks.json'), rows);
 addSemgrep(readJson('qa-results/semgrep.json'), rows);
@@ -1255,7 +1280,7 @@ buildPlaywrightQaCases(testCases);
 buildVitestQaCases(readJson('qa-results/vitest.json'));
 buildNewmanQaCases(readJson('qa-results/newman.json'));
 buildK6QaCases(readJson('qa-results/k6-summary.json'));
-buildVisualQaCases(readJson('playwright-report/results.json'));
+buildVisualQaCases(mergedPlaywright);
 buildAxeQaCases(readJsonDir('qa-results/axe'));
 buildGitleaksQaCases(readJson('qa-results/gitleaks.json'));
 buildSemgrepQaCases(readJson('qa-results/semgrep.json'));
@@ -1314,6 +1339,16 @@ function addScript(scripts, name, command) {
   if (!scripts[name]) scripts[name] = command;
 }
 
+// Upgrade an agent-managed script: if the existing value is one of the known
+// prior versions (or missing), replace with the new command. Preserves any
+// user-customized command (where the existing value doesn't match a known
+// prior version we shipped).
+function upgradeScript(scripts, name, newCmd, knownPriorCmds = []) {
+  if (!scripts[name] || knownPriorCmds.includes(scripts[name])) {
+    scripts[name] = newCmd;
+  }
+}
+
 function addDevDependency(devDependencies, name, version) {
   if (!devDependencies[name]) devDependencies[name] = version;
 }
@@ -1334,9 +1369,15 @@ export function generateAssets(scan, plan, options = {}) {
 
   if (enabled.has("playwright")) {
     const journeys = journeysOverride || discoverUserJourneys(scan.files);
-    addScript(pkg.scripts, "qa:smoke", "playwright test tests/smoke");
-    addScript(pkg.scripts, "qa:e2e", "playwright test tests/e2e");
-    addScript(pkg.scripts, "qa:journeys", "playwright test tests/e2e/user-journeys.spec.ts");
+    upgradeScript(pkg.scripts, "qa:smoke",
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/smoke.json playwright test tests/smoke",
+      ["playwright test tests/smoke"]);
+    upgradeScript(pkg.scripts, "qa:e2e",
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/e2e.json playwright test tests/e2e/critical-journey.spec.ts",
+      ["playwright test tests/e2e"]);
+    upgradeScript(pkg.scripts, "qa:journeys",
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/journeys.json playwright test tests/e2e/user-journeys.spec.ts",
+      ["playwright test tests/e2e/user-journeys.spec.ts"]);
     addDevDependency(deps, "@playwright/test", "^1.56.1");
     if (!scan.facts.hasPlaywrightConfig) files.push({ path: "playwright.config.ts", content: PLAYWRIGHT_CONFIG });
     files.push({ path: "tests/smoke/qa-smoke.spec.ts", content: PLAYWRIGHT_SMOKE });
@@ -1362,7 +1403,7 @@ export function generateAssets(scan, plan, options = {}) {
   }
 
   if (enabled.has("postman") || enabled.has("k6")) {
-    const endpoints = discoverApiEndpoints(scan.files);
+    const endpoints = discoverApiEndpoints(scan.files, { repoRoot: scan.root });
     if (enabled.has("postman")) {
       addScript(pkg.scripts, "qa:api", "npm run qa:prepare && newman run postman/qa-collection.json -e postman/qa-env.json --reporters cli,json --reporter-json-export qa-results/newman.json");
       addDevDependency(deps, "newman", "^6.2.1");
@@ -1377,7 +1418,9 @@ export function generateAssets(scan, plan, options = {}) {
 
   if (enabled.has("axe") && enabled.has("playwright")) {
     const journeys = journeysOverride || discoverUserJourneys(scan.files);
-    addScript(pkg.scripts, "qa:a11y", "playwright test tests/a11y/qa-a11y.spec.ts");
+    upgradeScript(pkg.scripts, "qa:a11y",
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/a11y.json playwright test tests/a11y/qa-a11y.spec.ts",
+      ["playwright test tests/a11y/qa-a11y.spec.ts"]);
     addDevDependency(deps, "@axe-core/playwright", "^4.10.1");
     addDevDependency(deps, "axe-core", "^4.10.2");
     files.push({ path: "tests/a11y/qa-a11y.spec.ts", content: createAxeSpec(journeys) });
@@ -1385,8 +1428,12 @@ export function generateAssets(scan, plan, options = {}) {
 
   if (enabled.has("visual") && enabled.has("playwright")) {
     const journeys = journeysOverride || discoverUserJourneys(scan.files);
-    addScript(pkg.scripts, "qa:visual", "playwright test tests/visual/qa-visual.spec.ts");
-    addScript(pkg.scripts, "qa:visual:update", "playwright test tests/visual/qa-visual.spec.ts --update-snapshots");
+    upgradeScript(pkg.scripts, "qa:visual",
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/visual.json playwright test tests/visual/qa-visual.spec.ts",
+      ["playwright test tests/visual/qa-visual.spec.ts"]);
+    upgradeScript(pkg.scripts, "qa:visual:update",
+      "PLAYWRIGHT_JSON_OUTPUT_FILE=playwright-report/visual.json playwright test tests/visual/qa-visual.spec.ts --update-snapshots",
+      ["playwright test tests/visual/qa-visual.spec.ts --update-snapshots"]);
     files.push({ path: "tests/visual/qa-visual.spec.ts", content: createVisualSpec(journeys) });
   }
 
