@@ -668,6 +668,33 @@ test("loadDotenv is a no-op when no files exist", async () => {
   assert.deepEqual(result.setKeys, []);
 });
 
+test("k6 script treats 4xx as expected and sends a probe body for POST/PUT/PATCH", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const assets = generateAssets(scan, createTestPlan(scan, detectStack(scan)));
+  const k6 = assets.files.find((f) => f.path === "tests/performance/load.js");
+  assert.ok(k6, "k6 script should be generated");
+  assert.match(k6.content, /http\.setResponseCallback\(http\.expectedStatuses\(\{ min: 200, max: 499 \}\)\)/);
+  assert.match(k6.content, /METHODS_WITH_BODY = new Set\(\['POST', 'PUT', 'PATCH'\]\)/);
+  assert.match(k6.content, /JSON\.stringify\(\{ qaProbe: true \}\)/);
+  assert.match(k6.content, /'Content-Type': 'application\/json'/);
+});
+
+test("orchestrator suppresses the spawn-shell-true Semgrep false positive", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const assets = generateAssets(scan, createTestPlan(scan, detectStack(scan)));
+  const runAll = assets.files.find((f) => f.path === "scripts/qa-run-all.mjs");
+  assert.ok(runAll, "orchestrator should be generated");
+  // At least one nosemgrep marker per spawn site (currently runScript,
+  // runBuildScript, withAppServer = 3 spawn calls with shell:true gated on
+  // win32). Allow for future spawn additions by asserting "at least 2".
+  const markers = (runAll.content.match(/nosemgrep: javascript\.lang\.security\.audit\.spawn-shell-true/g) || []);
+  assert.equal(markers.length >= 2, true, "expected at least two nosemgrep markers, got " + markers.length);
+  // The actual shell:true line still follows on the next line.
+  assert.match(runAll.content, /shell: process\.platform === 'win32',/);
+});
+
 test("orchestrator auto-builds when start is selected and a build script exists", async () => {
   const dir = await makeFixture();
   const scan = await scanRepository(dir);

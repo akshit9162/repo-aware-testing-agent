@@ -350,6 +350,13 @@ function createK6Script(endpoints) {
 import { check, sleep } from 'k6';
 import { group } from 'k6';
 
+// k6's default http_req_failed counts anything outside 200-399 as a failure.
+// For a load-test against a discovered endpoint surface we only care about
+// 5xx (server actually broke) — 4xx means the request reached the handler
+// and validation rejected it, which is expected when we don't know the
+// exact request shape for every endpoint.
+http.setResponseCallback(http.expectedStatuses({ min: 200, max: 499 }));
+
 export const options = {
   vus: Number(__ENV.QA_K6_VUS || 5),
   duration: __ENV.QA_K6_DURATION || '30s',
@@ -362,13 +369,24 @@ export const options = {
 
 const endpoints = ${JSON.stringify(targets, null, 2)};
 
+const METHODS_WITH_BODY = new Set(['POST', 'PUT', 'PATCH']);
+
 export default function () {
   const baseUrl = __ENV.QA_K6_BASE_URL || __ENV.QA_API_BASE_URL || 'http://localhost:3000';
   for (const endpoint of endpoints) {
     const path = __ENV[endpoint.env] || endpoint.path;
     const url = baseUrl.replace(/\\/$/, '') + path;
+    const params = {};
+    let body = null;
+    if (METHODS_WITH_BODY.has(endpoint.method)) {
+      // Minimal JSON probe body so the request reaches the handler. The
+      // handler will usually reject it as invalid (400) — that's fine,
+      // 4xx is treated as expected by the response callback above.
+      body = JSON.stringify({ qaProbe: true });
+      params.headers = { 'Content-Type': 'application/json' };
+    }
     group(endpoint.method + ' ' + path, () => {
-      const res = http.request(endpoint.method, url);
+      const res = http.request(endpoint.method, url, body, params);
       check(res, {
         'status is below 500': (r) => r.status < 500,
         'response completed under 1s': (r) => r.timings.duration < 1000,
@@ -525,6 +543,7 @@ function runScript(script, { timeoutMs = stageTimeoutMs } = {}) {
   return new Promise((resolve) => {
     const started = Date.now();
     process.stdout.write('\\n[qa:all] running ' + script + ' (' + (STAGE_PROFILE[script]?.tier || 'unknown') + ')\\n');
+    // nosemgrep: javascript.lang.security.audit.spawn-shell-true.spawn-shell-true -- Windows-only narrow shell so PowerShell can resolve npm (a .cmd shim); on macOS/Linux shell is false. Args are not user-controlled.
     const child = spawn('npm', ['run', script], {
       stdio: 'inherit',
       shell: process.platform === 'win32',
@@ -571,6 +590,7 @@ async function runBuildScript() {
   if (!pkg.scripts?.build) return true;
   return new Promise((resolve) => {
     process.stdout.write('[qa:all] running npm run build before app server start\\n');
+    // nosemgrep: javascript.lang.security.audit.spawn-shell-true.spawn-shell-true -- Windows-only narrow shell so PowerShell can resolve npm (a .cmd shim); on macOS/Linux shell is false. Args are not user-controlled.
     const child = spawn('npm', ['run', 'build'], {
       stdio: 'inherit',
       shell: process.platform === 'win32',
@@ -600,6 +620,7 @@ async function withAppServer(run) {
   const logPath = path.join(RESULTS_DIR, 'app-server.log');
   const log = createWriteStream(logPath, { flags: 'a' });
   process.stdout.write('[qa:all] starting app server (npm run ' + startScript + '), logs -> qa-results/app-server.log\\n');
+  // nosemgrep: javascript.lang.security.audit.spawn-shell-true.spawn-shell-true -- Windows-only narrow shell so PowerShell can resolve npm (a .cmd shim); on macOS/Linux shell is false. Args are not user-controlled.
   const child = spawn('npm', ['run', startScript], {
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: process.platform === 'win32',
