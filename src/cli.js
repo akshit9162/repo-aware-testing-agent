@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys } from "./index.js";
+import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, importHar } from "./index.js";
 import { writePlaywrightCoverageExcel } from "./playwrightExcel.js";
 
-const KNOWN_TOOLS = ["playwright", "vitest", "sonarqube", "postman", "trivy", "k6", "axe", "gitleaks", "semgrep"];
+const KNOWN_TOOLS = ["playwright", "vitest", "sonarqube", "postman", "trivy", "k6", "axe", "gitleaks", "semgrep", "visual"];
 
 function splitList(value) {
   return value
@@ -45,6 +45,14 @@ LLM enrichment:
 Subcommands:
   coverage-excel <playwright-json-report> --out <report.xls>
                        Convert a Playwright JSON report to an Excel-friendly workbook
+  crawl <baseUrl> [--depth N] [--max N] [--out <path>]
+                       Breadth-first link-graph crawl from baseUrl. Prints JSON
+                       to stdout (or writes to --out). Use to discover dynamic
+                       routes the static scan misses.
+  har <file.har> [--out postman/qa-collection.json] [--replace] [--filter-origin <origin>]
+                       Import requests from a HAR file (DevTools > Network >
+                       export) into a Postman v2.1 collection. Default merges
+                       into existing collection, deduping by method+URL.
 `);
 }
 
@@ -88,6 +96,28 @@ function parseArgs(argv) {
   return args;
 }
 
+function parseHarArgs(argv) {
+  const args = { input: argv[1], outPath: "postman/qa-collection.json", replace: false, filterOrigin: null };
+  for (let i = 2; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--out") { args.outPath = argv[i + 1]; i += 1; }
+    else if (arg === "--replace") { args.replace = true; }
+    else if (arg === "--filter-origin") { args.filterOrigin = argv[i + 1]; i += 1; }
+  }
+  return args;
+}
+
+function parseCrawlArgs(argv) {
+  const args = { baseUrl: argv[1], depth: undefined, max: undefined, outPath: null };
+  for (let i = 2; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--depth") { args.depth = Number(argv[i + 1]); i += 1; }
+    else if (arg === "--max") { args.max = Number(argv[i + 1]); i += 1; }
+    else if (arg === "--out") { args.outPath = argv[i + 1]; i += 1; }
+  }
+  return args;
+}
+
 function parseCoverageArgs(argv) {
   const args = {
     inputPath: argv[1],
@@ -111,6 +141,40 @@ async function main() {
     }
     const summary = await writePlaywrightCoverageExcel(args.inputPath, args.outputPath);
     console.log(JSON.stringify({ output: path.resolve(args.outputPath), summary }, null, 2));
+    return;
+  }
+
+  if (argv[0] === "har") {
+    const harArgs = parseHarArgs(argv);
+    if (!harArgs.input) {
+      throw new Error("Usage: repo-qa-agent har <file.har> [--out postman/qa-collection.json] [--replace] [--filter-origin <https://host>]");
+    }
+    const result = await importHar(harArgs.input, {
+      outPath: harArgs.outPath,
+      merge: !harArgs.replace,
+      filterOrigin: harArgs.filterOrigin,
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (argv[0] === "crawl") {
+    const crawlArgs = parseCrawlArgs(argv);
+    if (!crawlArgs.baseUrl) {
+      throw new Error("Usage: repo-qa-agent crawl <baseUrl> [--depth N] [--max N] [--out <path>]");
+    }
+    const journeys = await crawlSite(crawlArgs.baseUrl, {
+      depth: crawlArgs.depth,
+      maxPages: crawlArgs.max,
+      logger: (msg) => process.stderr.write("[crawl] " + msg + "\n"),
+    });
+    const output = JSON.stringify({ baseUrl: crawlArgs.baseUrl, count: journeys.length, journeys }, null, 2);
+    if (crawlArgs.outPath) {
+      await fs.writeFile(crawlArgs.outPath, output + "\n", "utf8");
+      console.log(JSON.stringify({ wrote: path.resolve(crawlArgs.outPath), count: journeys.length }, null, 2));
+    } else {
+      console.log(output);
+    }
     return;
   }
 

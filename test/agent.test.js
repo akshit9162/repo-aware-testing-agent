@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 import {
   scanRepository,
   detectStack,
@@ -17,6 +18,9 @@ import {
   discoverUserJourneys,
   discoverUnitTestTargets,
   enrichJourneys,
+  crawlSite,
+  mergeJourneys,
+  importHar,
   summarizePlaywrightReport,
   writePlaywrightCoverageExcel,
 } from "../src/index.js";
@@ -428,6 +432,111 @@ test("LLM enrichment short-circuits when no api key and no client provided", asy
   const { enriched, stats } = await enrichJourneys({ repoRoot: dir, journeys });
   assert.equal(enriched.size, 0);
   assert.equal(stats.requested, 0);
+});
+
+test("crawler walks same-origin link graph BFS to configured depth", async () => {
+  const pages = {
+    "/": `<!doctype html><html><head><title>Home</title></head><body><a href="/about">About</a><a href="/contact">Contact</a><a href="https://external.example/x">ext</a><a href="mailto:a@b">m</a></body></html>`,
+    "/about": `<!doctype html><html><head><title>About Us</title></head><body><a href="/team">Team</a><a href="/">home</a></body></html>`,
+    "/contact": `<!doctype html><html><head><title>Contact</title></head><body><h1>Reach out</h1></body></html>`,
+    "/team": `<!doctype html><html><head><title>Team</title></head><body><a href="/about">About</a></body></html>`,
+  };
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://localhost");
+    const body = pages[url.pathname];
+    if (body) {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(body);
+    } else {
+      res.writeHead(404).end();
+    }
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const port = server.address().port;
+  try {
+    const journeys = await crawlSite(`http://127.0.0.1:${port}/`, { depth: 2, maxPages: 10 });
+    const paths = journeys.map((j) => j.path).sort();
+    assert.deepEqual(paths, ["/", "/about", "/contact", "/team"]);
+    assert.equal(journeys.find((j) => j.path === "/").title, "Home");
+    assert.equal(journeys.find((j) => j.path === "/contact").title, "Contact");
+    // External + mailto should have been excluded.
+    assert.equal(paths.includes("/x"), false);
+  } finally {
+    server.close();
+  }
+});
+
+test("crawler depth=0 discovers only the entry page", async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end(`<html><head><title>Root</title></head><body><a href="/other">other</a></body></html>`);
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const port = server.address().port;
+  try {
+    const journeys = await crawlSite(`http://127.0.0.1:${port}/`, { depth: 0, maxPages: 10 });
+    assert.equal(journeys.length, 1);
+    assert.equal(journeys[0].path, "/");
+  } finally {
+    server.close();
+  }
+});
+
+test("mergeJourneys prefers static records over crawled on path collisions", () => {
+  const staticJourneys = [{ path: "/", title: "static home", source: "app/page.tsx" }];
+  const crawled = [{ path: "/", title: "crawled home", source: "crawl" }, { path: "/extra", title: "extra", source: "crawl" }];
+  const merged = mergeJourneys(staticJourneys, crawled);
+  const home = merged.find((j) => j.path === "/");
+  assert.equal(home.source, "app/page.tsx", "static record should win on overlap");
+  assert.equal(merged.length, 2);
+  assert.equal(merged.find((j) => j.path === "/extra").source, "crawl");
+});
+
+test("importHar merges entries into postman collection with dedup", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-har-"));
+  const harPath = path.join(dir, "sample.har");
+  const outPath = path.join(dir, "postman", "qa-collection.json");
+  await fs.writeFile(harPath, JSON.stringify({
+    log: {
+      entries: [
+        { request: { method: "GET", url: "https://api.example.com/v1/health", headers: [{ name: "accept", value: "application/json" }] } },
+        { request: { method: "POST", url: "https://api.example.com/v1/orders", headers: [], postData: { mimeType: "application/json", text: "{\"sku\":\"x\"}" } } },
+        { request: { method: "GET", url: "https://api.example.com/v1/health", headers: [] } }, // dupe
+      ],
+    },
+  }), "utf8");
+
+  const first = await importHar(harPath, { outPath });
+  assert.equal(first.imported, 2);
+  assert.equal(first.skippedAsDupes, 1);
+  assert.equal(first.total, 2);
+
+  // Second import of same file should be a full no-op on the collection.
+  const second = await importHar(harPath, { outPath });
+  assert.equal(second.imported, 0);
+  assert.equal(second.skippedAsDupes, 3);
+  assert.equal(second.total, 2);
+
+  const collection = JSON.parse(await fs.readFile(outPath, "utf8"));
+  assert.equal(collection.item.length, 2);
+  const post = collection.item.find((i) => i.request.method === "POST");
+  assert.match(post.event[0].script.exec.join("\n"), /does not return server error/);
+  assert.equal(post.request.body.raw, "{\"sku\":\"x\"}");
+});
+
+test("Next.js fixture scaffolds visual stage with screenshot spec", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const plan = createTestPlan(scan, detectStack(scan));
+  const assets = generateAssets(scan, plan);
+
+  assert.equal(plan.enabledTools.includes("visual"), true);
+  assert.match(assets.packageJson, /qa:visual/);
+  assert.match(assets.packageJson, /qa:visual:update/);
+  const visualSpec = assets.files.find((f) => f.path === "tests/visual/qa-visual.spec.ts");
+  assert.ok(visualSpec, "visual spec should be generated");
+  assert.match(visualSpec.content, /toHaveScreenshot/);
+  assert.match(visualSpec.content, /maxDiffPixelRatio/);
 });
 
 test("generated QA reporter summarizes all available artifacts", async () => {

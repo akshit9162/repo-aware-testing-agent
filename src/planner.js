@@ -75,6 +75,11 @@ export function createTestPlan(scan, stack, options = {}) {
       purpose: "Accessibility checks via axe-core on every discovered route.",
     },
     {
+      name: "visual",
+      enabled: stack.hasFrontend,
+      purpose: "Visual regression via Playwright screenshot baselines.",
+    },
+    {
       name: "gitleaks",
       enabled: true,
       purpose: "Secret scanning across the repository tree.",
@@ -111,6 +116,7 @@ export function createTestPlan(scan, stack, options = {}) {
       "qa:journeys",
       "qa:e2e",
       "qa:a11y",
+      "qa:visual",
       "qa:api",
       "qa:quality",
       "qa:security",
@@ -119,6 +125,7 @@ export function createTestPlan(scan, stack, options = {}) {
       if (script === "qa:unit") return enabledTools.has("vitest");
       if (script === "qa:smoke" || script === "qa:journeys" || script === "qa:e2e") return enabledTools.has("playwright");
       if (script === "qa:a11y") return enabledTools.has("axe");
+      if (script === "qa:visual") return enabledTools.has("visual");
       if (script === "qa:api") return enabledTools.has("postman");
       if (script === "qa:perf") return enabledTools.has("k6");
       if (script === "qa:quality") return enabledTools.has("sonarqube");

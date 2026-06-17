@@ -145,6 +145,43 @@ for (const journey of journeys) {
 `;
 }
 
+function createVisualSpec(journeys) {
+  const rows = journeys.map((journey) => ({ title: journey.title, path: journey.path, env: journey.env }));
+  return `import { expect, test } from '@playwright/test';
+
+const journeys = ${JSON.stringify(rows, null, 2)};
+
+// Visual regression. First run records baselines under
+// tests/visual/__screenshots__/. Subsequent runs diff against the baseline
+// and fail when pixels exceed QA_VISUAL_MAX_DIFF_PIXELS (default 100) or
+// QA_VISUAL_MAX_DIFF_RATIO (default 0.01). Re-record with:
+//   npx playwright test tests/visual --update-snapshots
+
+function slug(routePath) {
+  return (routePath || 'root').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'root';
+}
+
+const maxDiffPixels = Number(process.env.QA_VISUAL_MAX_DIFF_PIXELS || 100);
+const maxDiffPixelRatio = Number(process.env.QA_VISUAL_MAX_DIFF_RATIO || 0.01);
+
+for (const journey of journeys) {
+  test(\`visual: \${journey.title}\`, async ({ page }) => {
+    const targetPath = process.env[journey.env] || journey.path;
+    await page.goto(targetPath, { waitUntil: 'networkidle' });
+    await page.waitForLoadState('domcontentloaded');
+    // Hide caret + disable animations to keep baselines stable.
+    await page.addStyleTag({ content: '*, *::before, *::after { animation: none !important; transition: none !important; caret-color: transparent !important; }' });
+    await expect(page).toHaveScreenshot(slug(journey.path) + '.png', {
+      fullPage: true,
+      animations: 'disabled',
+      maxDiffPixels,
+      maxDiffPixelRatio,
+    });
+  });
+}
+`;
+}
+
 function createAxeSpec(journeys) {
   const rows = journeys.map((journey) => ({ title: journey.title, path: journey.path, env: journey.env }));
   return `import { expect, test } from '@playwright/test';
@@ -375,6 +412,10 @@ const STAGE_PROFILES = {
   "qa:a11y": {
     tier: "needs-app",
     touches: ["src/", "app/", "pages/", "components/", "tests/a11y/"],
+  },
+  "qa:visual": {
+    tier: "needs-app",
+    touches: ["src/", "app/", "pages/", "components/", "tests/visual/"],
   },
   "qa:api": {
     tier: "needs-app",
@@ -764,8 +805,10 @@ function flattenPlaywrightSuite(suite, rows = [], parentTitles = []) {
 
 function addPlaywright(report, rows, testCases) {
   if (!report) return;
-  const cases = (report.suites || []).flatMap((suite) => flattenPlaywrightSuite(suite));
-  testCases.push(...cases);
+  const allCases = (report.suites || []).flatMap((suite) => flattenPlaywrightSuite(suite));
+  testCases.push(...allCases);
+  // Visual tests get their own row; exclude here to avoid double-counting totals.
+  const cases = allCases.filter((c) => !(/tests\\/visual\\//.test(c.file || '') || (c.title || '').includes('visual:')));
   const passed = cases.filter((test) => test.status === 'passed').length;
   const failed = cases.filter((test) => test.status === 'failed').length;
   const skipped = cases.filter((test) => test.status === 'skipped').length;
@@ -828,6 +871,26 @@ function addK6(report, rows) {
   };
   if (breaches.length) item.breaches = breaches;
   rows.push(item);
+}
+
+function addVisual(playwrightReport, rows) {
+  if (!playwrightReport) return;
+  const cases = (playwrightReport.suites || []).flatMap((suite) => flattenPlaywrightSuite(suite));
+  const visual = cases.filter((c) => /tests\\/visual\\//.test(c.file || '') || (c.title || '').includes('visual:'));
+  if (!visual.length) return;
+  const passed = visual.filter((c) => c.status === 'passed').length;
+  const failed = visual.filter((c) => c.status === 'failed').length;
+  const skipped = visual.filter((c) => c.status === 'skipped').length;
+  rows.push({
+    tool: 'visual',
+    status: failed ? 'failed' : 'passed',
+    total: visual.length,
+    passed,
+    failed,
+    skipped,
+    coverage: failed ? failed + ' diff(s)' : '',
+    source: 'playwright-report/results.json (tests/visual)',
+  });
 }
 
 function addAxe(reports, rows) {
@@ -1060,6 +1123,28 @@ function buildK6QaCases(report) {
   }
 }
 
+function buildVisualQaCases(playwrightReport) {
+  if (!playwrightReport) return;
+  const cases = (playwrightReport.suites || []).flatMap((suite) => flattenPlaywrightSuite(suite));
+  const visual = cases.filter((c) => /tests\\/visual\\//.test(c.file || '') || (c.title || '').includes('visual:'));
+  for (const c of visual) {
+    const failed = c.status === 'failed';
+    qaCases.push({
+      testCaseId: nextId('QA-VIS'),
+      pageName: c.title.replace(/^.*?visual:\\s*/, ''),
+      summary: c.title,
+      priority: failed ? 'High' : 'Medium',
+      prerequisites: 'App reachable at QA_BASE_URL; baseline images committed',
+      testType: 'Visual',
+      testSteps: 'Navigate to route, take full-page screenshot, compare to baseline',
+      testData: 'maxDiffPixels=' + (process.env.QA_VISUAL_MAX_DIFF_PIXELS || 100) + '; maxDiffPixelRatio=' + (process.env.QA_VISUAL_MAX_DIFF_RATIO || 0.01),
+      expectedResult: 'Screenshot matches baseline within configured tolerance',
+      actualResult: failed ? (c.errors || 'Diff exceeded tolerance') : 'Matches baseline (' + c.durationMs + 'ms)',
+      status: failed ? 'Fail' : (c.status === 'skipped' ? 'Skipped' : 'Pass'),
+    });
+  }
+}
+
 function buildAxeQaCases(reports) {
   if (!reports.length) return;
   const PRIORITY = { critical: 'Critical', serious: 'High', moderate: 'Medium', minor: 'Low' };
@@ -1157,6 +1242,7 @@ addPlaywright(readJson('playwright-report/results.json'), rows, testCases);
 addVitest(readJson('qa-results/vitest.json'), rows);
 addNewman(readJson('qa-results/newman.json'), rows);
 addK6(readJson('qa-results/k6-summary.json'), rows);
+addVisual(readJson('playwright-report/results.json'), rows);
 addAxe(readJsonDir('qa-results/axe'), rows);
 addGitleaks(readJson('qa-results/gitleaks.json'), rows);
 addSemgrep(readJson('qa-results/semgrep.json'), rows);
@@ -1169,6 +1255,7 @@ buildPlaywrightQaCases(testCases);
 buildVitestQaCases(readJson('qa-results/vitest.json'));
 buildNewmanQaCases(readJson('qa-results/newman.json'));
 buildK6QaCases(readJson('qa-results/k6-summary.json'));
+buildVisualQaCases(readJson('playwright-report/results.json'));
 buildAxeQaCases(readJsonDir('qa-results/axe'));
 buildGitleaksQaCases(readJson('qa-results/gitleaks.json'));
 buildSemgrepQaCases(readJson('qa-results/semgrep.json'));
@@ -1293,6 +1380,13 @@ export function generateAssets(scan, plan, options = {}) {
     addDevDependency(deps, "@axe-core/playwright", "^4.10.1");
     addDevDependency(deps, "axe-core", "^4.10.2");
     files.push({ path: "tests/a11y/qa-a11y.spec.ts", content: createAxeSpec(journeys) });
+  }
+
+  if (enabled.has("visual") && enabled.has("playwright")) {
+    const journeys = discoverUserJourneys(scan.files);
+    addScript(pkg.scripts, "qa:visual", "playwright test tests/visual/qa-visual.spec.ts");
+    addScript(pkg.scripts, "qa:visual:update", "playwright test tests/visual/qa-visual.spec.ts --update-snapshots");
+    files.push({ path: "tests/visual/qa-visual.spec.ts", content: createVisualSpec(journeys) });
   }
 
   if (enabled.has("gitleaks")) {

@@ -16,6 +16,7 @@ const QA_SCAFFOLD_PATHS = new Set([
   "tests/e2e/critical-journey.spec.ts",
   "tests/e2e/user-journeys.spec.ts",
   "tests/a11y/qa-a11y.spec.ts",
+  "tests/visual/qa-visual.spec.ts",
   "tests/performance/load.js",
   "postman/qa-collection.json",
   "postman/qa-env.json",
