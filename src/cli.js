@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets } from "./index.js";
+import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys } from "./index.js";
 import { writePlaywrightCoverageExcel } from "./playwrightExcel.js";
 
-const KNOWN_TOOLS = ["playwright", "vitest", "sonarqube", "postman", "trivy", "k6"];
+const KNOWN_TOOLS = ["playwright", "vitest", "sonarqube", "postman", "trivy", "k6", "axe", "gitleaks", "semgrep"];
 
 function splitList(value) {
   return value
@@ -31,7 +31,16 @@ Options:
   --only <tools>       Comma-separated list of tools to keep (${KNOWN_TOOLS.join(", ")})
   --skip <tools>       Comma-separated list of tools to skip
   --plan <path>        Also write the plan JSON to this path
+  --no-llm             Disable LLM journey enrichment (also: QA_LLM=0)
   --help, -h           Show this help
+
+LLM enrichment:
+  Set ANTHROPIC_API_KEY (Claude) or OPENAI_API_KEY (GPT) to enrich the
+  Playwright user-journey assertions per route. Anthropic is preferred
+  when both keys are set; override with QA_LLM_PROVIDER=openai|anthropic.
+  Defaults: claude-sonnet-4-6 / gpt-4o-mini (override with
+  QA_LLM_MODEL). Requires @anthropic-ai/sdk or openai installed.
+  Cache: .qa-agent-cache/llm-enrich/
 
 Subcommands:
   coverage-excel <playwright-json-report> --out <report.xls>
@@ -48,12 +57,14 @@ function parseArgs(argv) {
     only: [],
     skip: [],
     planPath: null,
+    llm: process.env.QA_LLM !== "0",
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--write") args.write = true;
     else if (arg === "--overwrite" || arg === "--force") args.overwrite = true;
     else if (arg === "--dry-run") args.dryRun = true;
+    else if (arg === "--no-llm") args.llm = false;
     else if (arg === "--only") {
       args.only = splitList(argv[i + 1] || "");
       i += 1;
@@ -112,7 +123,27 @@ async function main() {
   const scan = await scanRepository(args.repoPath);
   const stack = detectStack(scan);
   const plan = createTestPlan(scan, stack, { only: args.only, skip: args.skip });
-  const assets = generateAssets(scan, plan);
+
+  let enrichmentStats = { provider: null, model: null, requested: 0, cached: 0, succeeded: 0, failed: 0, skipped: 0 };
+  let enrichmentMap = new Map();
+  // Always invoke when Playwright is enabled — enrichJourneys falls back to
+  // cache-only mode when no API key is present, preserving prior enrichments.
+  const llmEligible = args.llm && plan.enabledTools.includes("playwright");
+  if (llmEligible) {
+    const journeys = discoverUserJourneys(scan.files);
+    const result = await enrichJourneys({
+      repoRoot: scan.root,
+      journeys,
+      anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+      openaiApiKey: process.env.OPENAI_API_KEY,
+      model: process.env.QA_LLM_MODEL,
+      logger: (msg) => process.stderr.write("[llm-enrich] " + msg + "\n"),
+    });
+    enrichmentMap = result.enriched;
+    enrichmentStats = result.stats;
+  }
+
+  const assets = generateAssets(scan, plan, { enrichment: enrichmentMap });
   const planPath = args.planPath ? path.resolve(args.repoPath, args.planPath) : null;
 
   if (planPath) {
@@ -127,6 +158,10 @@ async function main() {
     enabledTools: plan.enabledTools,
     filters: plan.filters,
     mode: args.write ? "write" : "preview",
+    enrichment: {
+      enabled: Boolean(llmEligible),
+      stats: enrichmentStats,
+    },
   };
 
   if (args.write) {

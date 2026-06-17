@@ -16,6 +16,7 @@ import {
   discoverSecurityTargets,
   discoverUserJourneys,
   discoverUnitTestTargets,
+  enrichJourneys,
   summarizePlaywrightReport,
   writePlaywrightCoverageExcel,
 } from "../src/index.js";
@@ -60,6 +61,14 @@ test("scans repo and generates customized QA assets", async () => {
   assert.match(assets.packageJson, /qa:journeys/);
   assert.match(assets.packageJson, /qa:report/);
   assert.match(assets.packageJson, /qa:all/);
+  assert.match(assets.packageJson, /qa:a11y/);
+  assert.match(assets.packageJson, /qa:secrets/);
+  assert.match(assets.packageJson, /qa:sast/);
+  assert.equal(plan.enabledTools.includes("axe"), true);
+  assert.equal(plan.enabledTools.includes("gitleaks"), true);
+  assert.equal(plan.enabledTools.includes("semgrep"), true);
+  assert.equal(assets.files.some((file) => file.path === "tests/a11y/qa-a11y.spec.ts"), true);
+  assert.equal(assets.files.some((file) => file.path === ".gitleaks.toml"), true);
   assert.equal(assets.files.some((file) => file.path === "tests/e2e/critical-journey.spec.ts"), true);
   assert.equal(assets.files.some((file) => file.path === "tests/unit/qa-generated-regression.test.js"), true);
   assert.equal(assets.files.some((file) => file.path === "scripts/qa-report.mjs"), true);
@@ -231,8 +240,13 @@ test("Python repo does not scaffold Vitest", async () => {
   assert.equal(stack.isJsTs, false);
   assert.equal(plan.enabledTools.includes("vitest"), false);
   assert.equal(plan.enabledTools.includes("trivy"), true, "trivy should still run on Python repos with manifests");
+  assert.equal(plan.enabledTools.includes("gitleaks"), true, "gitleaks runs on any repo");
+  assert.equal(plan.enabledTools.includes("semgrep"), true, "semgrep runs on any repo (multi-language)");
+  assert.equal(plan.enabledTools.includes("axe"), false, "axe should not enable without a frontend");
   assert.equal(assets.files.some((file) => file.path === "tests/unit/qa-baseline.test.js"), false);
   assert.equal(assets.files.some((file) => file.path === ".trivyignore"), true);
+  assert.equal(assets.files.some((file) => file.path === ".gitleaks.toml"), true);
+  assert.equal(assets.files.some((file) => file.path === "tests/a11y/qa-a11y.spec.ts"), false);
   assert.match(assets.packageJson, /qa:security/);
   assert.equal(/qa:unit/.test(assets.packageJson), false);
 });
@@ -332,6 +346,90 @@ test("re-applying assets is idempotent", async () => {
   assert.equal(second.unchanged.includes("package.json"), true);
 });
 
+test("LLM enrichment returns canned data via injected client and is embedded in journey spec", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const journeys = discoverUserJourneys(scan.files);
+
+  const fakeClient = {
+    messages: {
+      create: async ({ messages }) => {
+        const userText = messages[0].content;
+        const isHome = /Route: \/\b|Route: \/$/.test(userText);
+        const payload = isHome
+          ? { description: "Home renders hero", expected: [{ kind: "heading", text: "Welcome" }, { kind: "link", name: "Get Started" }] }
+          : { description: "Page renders heading", expected: [{ kind: "heading", level: 1 }] };
+        return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+      },
+    },
+  };
+
+  const { enriched, stats } = await enrichJourneys({
+    repoRoot: dir,
+    journeys,
+    client: fakeClient,
+  });
+
+  assert.equal(stats.failed, 0);
+  assert.equal(enriched.size >= 1, true, "should produce at least one enrichment");
+
+  const plan = createTestPlan(scan, detectStack(scan));
+  const assets = generateAssets(scan, plan, { enrichment: enriched });
+  const journeySpec = assets.files.find((file) => file.path === "tests/e2e/user-journeys.spec.ts");
+  assert.match(journeySpec.content, /const ENRICHED = \{/);
+  assert.match(journeySpec.content, /checkEnrichment/);
+  // At least one of the enriched payloads should land in the file content.
+  assert.equal(
+    /"description": "Home renders hero"/.test(journeySpec.content) ||
+      /"description": "Page renders heading"/.test(journeySpec.content),
+    true,
+    "rendered spec should embed at least one enrichment payload"
+  );
+});
+
+test("LLM enrichment dispatches to OpenAI shape when client.chat.completions exists", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const journeys = discoverUserJourneys(scan.files);
+
+  let captured = null;
+  const fakeOpenAI = {
+    chat: {
+      completions: {
+        create: async (req) => {
+          captured = req;
+          const payload = { description: "OpenAI-routed", expected: [{ kind: "heading", text: "Welcome" }] };
+          return { choices: [{ message: { content: JSON.stringify(payload) } }] };
+        },
+      },
+    },
+  };
+
+  const { enriched, stats } = await enrichJourneys({
+    repoRoot: dir,
+    journeys,
+    client: fakeOpenAI,
+  });
+
+  assert.equal(stats.provider, "openai");
+  assert.equal(stats.failed, 0);
+  assert.equal(enriched.size >= 1, true);
+  assert.ok(captured, "OpenAI client should have been called");
+  assert.equal(captured.response_format?.type, "json_schema");
+  assert.equal(captured.messages?.[0]?.role, "system");
+  // sanity: the same fixture rendered through Anthropic shape would not have set this.
+  assert.equal(typeof captured.model, "string");
+});
+
+test("LLM enrichment short-circuits when no api key and no client provided", async () => {
+  const dir = await makeFixture();
+  const scan = await scanRepository(dir);
+  const journeys = discoverUserJourneys(scan.files);
+  const { enriched, stats } = await enrichJourneys({ repoRoot: dir, journeys });
+  assert.equal(enriched.size, 0);
+  assert.equal(stats.requested, 0);
+});
+
 test("generated QA reporter summarizes all available artifacts", async () => {
   const dir = await makeFixture();
   const scan = await scanRepository(dir);
@@ -376,6 +474,24 @@ test("generated QA reporter summarizes all available artifacts", async () => {
     },
   }), "utf8");
   await fs.writeFile(path.join(dir, "qa-results", "trivy.json"), JSON.stringify({ Results: [] }), "utf8");
+  await fs.mkdir(path.join(dir, "qa-results", "axe"), { recursive: true });
+  await fs.writeFile(path.join(dir, "qa-results", "axe", "home.json"), JSON.stringify({
+    path: "/",
+    violations: [
+      { id: "color-contrast", impact: "serious", help: "Elements must have sufficient color contrast", helpUrl: "https://x", nodes: [{}, {}] },
+      { id: "image-alt", impact: "critical", help: "Images must have alt text", helpUrl: "https://y", nodes: [{}] },
+      { id: "label", impact: "minor", help: "Form elements must have labels", nodes: [{}] },
+    ],
+  }), "utf8");
+  await fs.writeFile(path.join(dir, "qa-results", "gitleaks.json"), JSON.stringify([
+    { RuleID: "openai-api-key", File: "src/config.ts", StartLine: 42, Match: "OPENAI_API_KEY=sk-...redacted" },
+  ]), "utf8");
+  await fs.writeFile(path.join(dir, "qa-results", "semgrep.json"), JSON.stringify({
+    version: "1.0", results: [
+      { check_id: "javascript.lang.security.audit.eval-detected", path: "src/util.js", start: { line: 12 }, extra: { severity: "ERROR", message: "Eval is dangerous" } },
+      { check_id: "javascript.lang.best-practice.foo", path: "src/x.js", start: { line: 1 }, extra: { severity: "INFO", message: "Info finding" } },
+    ],
+  }), "utf8");
   await fs.writeFile(path.join(dir, "coverage", "lcov.info"), "LF:10\nLH:8\nFNF:5\nFNH:5\nBRF:4\nBRH:2\n", "utf8");
 
   const result = spawnSync("node", ["scripts/qa-report.mjs"], { cwd: dir, encoding: "utf8" });
@@ -383,9 +499,23 @@ test("generated QA reporter summarizes all available artifacts", async () => {
   const report = JSON.parse(await fs.readFile(path.join(dir, "qa-results", "qa-report.json"), "utf8"));
   const workbook = await fs.readFile(path.join(dir, "qa-results", "qa-report.xls"), "utf8");
 
-  assert.equal(report.summary.total, 11);
-  assert.equal(report.summary.failed, 2);
+  // playwright 2 + vitest 2 + newman 3 + k6 4 + axe 3 + gitleaks 1 + semgrep 2 + trivy 0 = 17
+  assert.equal(report.summary.total, 17);
+  // failed: playwright 1 + vitest 1 + axe 2 (serious+critical) + gitleaks 1 + semgrep 1 (ERROR) = 6
+  assert.equal(report.summary.failed, 6);
   assert.equal(report.testCases.length, 2);
+  const toolNames = report.rows.map((row) => row.tool).sort();
+  assert.deepEqual(toolNames.filter((t) => ["axe", "gitleaks", "semgrep", "trivy"].includes(t)).sort(),
+    ["axe", "gitleaks", "semgrep", "trivy"]);
+  const a11yCases = report.qaTestCases.filter((c) => c.testCaseId.startsWith("QA-A11Y"));
+  const leakCases = report.qaTestCases.filter((c) => c.testCaseId.startsWith("QA-LEAK"));
+  const sastCases = report.qaTestCases.filter((c) => c.testCaseId.startsWith("QA-SAST"));
+  assert.equal(a11yCases.length, 3);
+  assert.equal(leakCases.length, 1);
+  assert.equal(sastCases.length, 2);
+  assert.equal(a11yCases.filter((c) => c.status === "Fail").length, 2);
+  assert.equal(leakCases[0].priority, "High");
+  assert.equal(sastCases.find((c) => c.priority === "High")?.summary, "javascript.lang.security.audit.eval-detected");
   assert.equal(report.testCases[0].title, "e2e > journey: checkout");
   assert.equal(report.testCases[0].status, "passed");
   assert.match(report.testCases[0].description, /discovered user journey/);

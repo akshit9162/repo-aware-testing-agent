@@ -69,6 +69,21 @@ export function createTestPlan(scan, stack, options = {}) {
       enabled: stack.hasApi,
       purpose: "Load and performance checks for API or critical user journeys.",
     },
+    {
+      name: "axe",
+      enabled: stack.hasFrontend,
+      purpose: "Accessibility checks via axe-core on every discovered route.",
+    },
+    {
+      name: "gitleaks",
+      enabled: true,
+      purpose: "Secret scanning across the repository tree.",
+    },
+    {
+      name: "semgrep",
+      enabled: true,
+      purpose: "Static analysis (SAST) using Semgrep's auto config.",
+    },
   ].map((tool) => ({ ...tool, enabled: tool.enabled && allow(tool.name) }));
 
   const enabledTools = new Set(tools.filter((tool) => tool.enabled).map((tool) => tool.name));
@@ -90,9 +105,12 @@ export function createTestPlan(scan, stack, options = {}) {
     filters: { only: [...only], skip: [...skip] },
     recommendedOrder: [
       "qa:unit",
+      "qa:secrets",
+      "qa:sast",
       "qa:smoke",
       "qa:journeys",
       "qa:e2e",
+      "qa:a11y",
       "qa:api",
       "qa:quality",
       "qa:security",
@@ -100,10 +118,13 @@ export function createTestPlan(scan, stack, options = {}) {
     ].filter((script) => {
       if (script === "qa:unit") return enabledTools.has("vitest");
       if (script === "qa:smoke" || script === "qa:journeys" || script === "qa:e2e") return enabledTools.has("playwright");
+      if (script === "qa:a11y") return enabledTools.has("axe");
       if (script === "qa:api") return enabledTools.has("postman");
       if (script === "qa:perf") return enabledTools.has("k6");
       if (script === "qa:quality") return enabledTools.has("sonarqube");
       if (script === "qa:security") return enabledTools.has("trivy");
+      if (script === "qa:secrets") return enabledTools.has("gitleaks");
+      if (script === "qa:sast") return enabledTools.has("semgrep");
       return true;
     }),
   };
