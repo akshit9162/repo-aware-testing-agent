@@ -218,16 +218,13 @@ async function resolveJourneyContent(journey, repoRoot) {
   return null;
 }
 
-async function importClient(provider, apiKey, logger) {
+async function importClient(provider, apiKey) {
   const sdkName = provider === "openai" ? "openai" : "@anthropic-ai/sdk";
-  try {
-    const mod = await import(sdkName);
-    const Ctor = mod.default || mod;
-    return new Ctor({ apiKey });
-  } catch (error) {
-    logger(`LLM enrichment disabled: ${sdkName} not installed`);
-    return null;
-  }
+  // Hard dependency — the SDK is required, not optional. If the package was
+  // somehow uninstalled, surface a clear error instead of silently degrading.
+  const mod = await import(sdkName);
+  const Ctor = mod.default || mod;
+  return new Ctor({ apiKey });
 }
 
 /**
@@ -253,23 +250,14 @@ export async function enrichJourneys({ repoRoot, journeys, apiKey, anthropicApiK
     });
   }
 
-  // No provider configured — fall back to cache-only mode so prior enrichments
-  // aren't lost across runs that happen to lack an API key.
+  // LLM enrichment is mandatory. If no provider could be resolved (no API key
+  // and no injected client), surface a clear error rather than silently
+  // degrading to cache-only or skeleton mode.
   if (!provider) {
-    const enriched = new Map();
-    const stats = { ...baseStats, provider: "cache-only", model: null };
-    for (const journey of journeys) {
-      const resolved = await resolveJourneyContent(journey, repoRoot);
-      if (!resolved) continue;
-      const cached = await readCached(repoRoot, hashKey(journey.path, resolved.content, resolved.kind));
-      if (cached) {
-        enriched.set(journey.path, cached);
-        stats.cached += 1;
-        stats.succeeded += 1;
-      }
-    }
-    stats.skipped = journeys.length - stats.succeeded;
-    return { enriched, stats };
+    throw new Error(
+      "LLM enrichment is required. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, " +
+      "or pass QA_LLM_PROVIDER explicitly."
+    );
   }
 
   const model = modelOverride || process.env.QA_LLM_MODEL || DEFAULT_MODELS[provider];
@@ -279,12 +267,9 @@ export async function enrichJourneys({ repoRoot, journeys, apiKey, anthropicApiK
     const resolvedKey = apiKey
       || (provider === "anthropic" ? (anthropicApiKey || process.env.ANTHROPIC_API_KEY) : (openaiApiKey || process.env.OPENAI_API_KEY));
     if (!resolvedKey) {
-      return { enriched: new Map(), stats: { ...baseStats, provider, model } };
+      throw new Error(`LLM enrichment is required: ${provider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY"} is not set.`);
     }
-    client = await importClient(provider, resolvedKey, logger);
-    if (!client) {
-      return { enriched: new Map(), stats: { ...baseStats, provider, model, error: "sdk not installed" } };
-    }
+    client = await importClient(provider, resolvedKey);
   }
 
   const inputs = [];

@@ -37,13 +37,14 @@ brew install sonar-scanner # qa:quality (only if you have SONAR_HOST_URL)
 On Linux: see each tool's docs. Trivy and gitleaks ship single binaries;
 Semgrep needs Python; k6 has its own installer.
 
-**Optional, for LLM-augmented Playwright assertions:**
-- `ANTHROPIC_API_KEY` (default model: `claude-sonnet-4-6`), or
-- `OPENAI_API_KEY` (default model: `gpt-4o-mini`)
+**Required when the Playwright stage is enabled** (every repo with a
+frontend triggers it):
+- `ANTHROPIC_API_KEY` (preferred, default model `claude-sonnet-4-6`), or
+- `OPENAI_API_KEY` (default model `gpt-4o-mini`)
 
-When set during scaffolding, the agent generates per-route assertions from
-the page component source. Skip the key and the agent emits a deterministic
-"page loads, body non-empty" skeleton instead.
+The agent uses the key to write per-route assertions into
+`tests/e2e/user-journeys.spec.ts`. Without a key, `--write` aborts with a
+clear error before any files are touched.
 
 ## Quick start
 
@@ -156,17 +157,18 @@ priority-labeled view.
 
 ## Optional power-ups
 
-### LLM-augmented Playwright assertions
+### LLM-augmented Playwright assertions (always on)
+
+Whenever Playwright is in the plan, the agent reads each discovered
+route's page component, asks Claude (or GPT) for the most stable visible
+elements, and embeds real role/text Playwright assertions into
+`tests/e2e/user-journeys.spec.ts`. Cache lives in
+`.qa-agent-cache/llm-enrich/`; re-runs hit cache.
 
 ```sh
 ANTHROPIC_API_KEY=sk-ant-... \
   node /path/to/agent/src/cli.js /path/to/your/repo --write
 ```
-
-The agent reads each discovered route's page component, asks Claude (or GPT
-with `OPENAI_API_KEY`) for the most stable visible elements, and embeds
-real role/text Playwright assertions into `tests/e2e/user-journeys.spec.ts`.
-Cache lives in `.qa-agent-cache/llm-enrich/`; re-runs hit cache.
 
 Override the model:
 ```sh

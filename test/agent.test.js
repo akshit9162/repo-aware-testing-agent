@@ -428,13 +428,24 @@ test("LLM enrichment dispatches to OpenAI shape when client.chat.completions exi
   assert.equal(typeof captured.model, "string");
 });
 
-test("LLM enrichment short-circuits when no api key and no client provided", async () => {
+test("LLM enrichment throws when no provider is available (no key, no client)", async () => {
   const dir = await makeFixture();
   const scan = await scanRepository(dir);
   const journeys = discoverUserJourneys(scan.files);
-  const { enriched, stats } = await enrichJourneys({ repoRoot: dir, journeys });
-  assert.equal(enriched.size, 0);
-  assert.equal(stats.requested, 0);
+  // Ensure env keys aren't picked up from the surrounding shell.
+  const savedAnthropic = process.env.ANTHROPIC_API_KEY;
+  const savedOpenAI = process.env.OPENAI_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  try {
+    await assert.rejects(
+      enrichJourneys({ repoRoot: dir, journeys }),
+      /LLM enrichment is required/,
+    );
+  } finally {
+    if (savedAnthropic !== undefined) process.env.ANTHROPIC_API_KEY = savedAnthropic;
+    if (savedOpenAI !== undefined) process.env.OPENAI_API_KEY = savedOpenAI;
+  }
 });
 
 test("crawler walks same-origin link graph BFS to configured depth", async () => {

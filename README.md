@@ -25,15 +25,16 @@ Security and performance checks are also generated from the scan. The agent writ
 
 Requires `trivy` on PATH (`brew install trivy` on macOS; see https://trivy.dev/ for other platforms).
 
-## LLM journey enrichment (optional)
+## LLM journey enrichment (required when Playwright is enabled)
 
-When `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set during generation, the
-agent calls Claude or GPT once per discovered route to identify the most
-important stable elements on each page (headings, CTAs, links, images)
-and embeds route-specific Playwright assertions into
-`tests/e2e/user-journeys.spec.ts`. When no key is set — or when called
-with `--no-llm` / `QA_LLM=0` — the agent emits the deterministic skeleton
-(page loads, body not empty, exercise visible inputs).
+Whenever the agent scaffolds the Playwright stage, it calls Claude or
+GPT once per discovered route to identify the most important stable
+elements on each page (headings, CTAs, links, images) and embeds
+route-specific Playwright assertions into
+`tests/e2e/user-journeys.spec.ts`. `ANTHROPIC_API_KEY` (preferred) or
+`OPENAI_API_KEY` must be set before running the agent on any repo where
+the Playwright stage is in the plan — the agent aborts with a clear
+error otherwise.
 
 Provider selection:
 
@@ -43,9 +44,9 @@ Provider selection:
   `gpt-4o-mini` (OpenAI). Override either with `QA_LLM_MODEL` (e.g.
   `QA_LLM_MODEL=claude-opus-4-8` for maximum precision, or
   `QA_LLM_MODEL=claude-haiku-4-5-20251001` to optimize for cost/latency).
-- Soft dependencies: requires `@anthropic-ai/sdk` or `openai` installed
-  in the target repo (or the agent dir). If the relevant SDK is missing,
-  enrichment is skipped silently and the deterministic path runs.
+- `@anthropic-ai/sdk` and `openai` are declared as hard dependencies of
+  the agent and installed by `npm install` in the agent dir. No soft
+  fallback path.
 
 Behaviour:
 

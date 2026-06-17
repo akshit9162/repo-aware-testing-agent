@@ -31,7 +31,6 @@ Options:
   --only <tools>       Comma-separated list of tools to keep (${KNOWN_TOOLS.join(", ")})
   --skip <tools>       Comma-separated list of tools to skip
   --plan <path>        Also write the plan JSON to this path
-  --no-llm             Disable LLM journey enrichment (also: QA_LLM=0)
   --crawl-url <url>    Crawl a live deployment, merge discovered routes with
                        the static-scan journeys, and use the captured HTML as
                        the LLM enrichment input (instead of source code).
@@ -39,12 +38,11 @@ Options:
   --crawl-max N        Max pages for --crawl-url (default 100)
   --help, -h           Show this help
 
-LLM enrichment:
-  Set ANTHROPIC_API_KEY (Claude) or OPENAI_API_KEY (GPT) to enrich the
-  Playwright user-journey assertions per route. Anthropic is preferred
-  when both keys are set; override with QA_LLM_PROVIDER=openai|anthropic.
-  Defaults: claude-sonnet-4-6 / gpt-4o-mini (override with
-  QA_LLM_MODEL). Requires @anthropic-ai/sdk or openai installed.
+LLM enrichment (required when the Playwright stage is enabled):
+  Set ANTHROPIC_API_KEY (Claude) or OPENAI_API_KEY (GPT) before running.
+  Anthropic is preferred when both are set; override with
+  QA_LLM_PROVIDER=openai|anthropic.
+  Defaults: claude-sonnet-4-6 / gpt-4o-mini (override with QA_LLM_MODEL).
   Cache: .qa-agent-cache/llm-enrich/
 
 Subcommands:
@@ -78,7 +76,6 @@ function parseArgs(argv) {
     only: [],
     skip: [],
     planPath: null,
-    llm: process.env.QA_LLM !== "0",
     crawlUrl: null,
     crawlDepth: 2,
     crawlMax: 100,
@@ -88,7 +85,6 @@ function parseArgs(argv) {
     if (arg === "--write") args.write = true;
     else if (arg === "--overwrite" || arg === "--force") args.overwrite = true;
     else if (arg === "--dry-run") args.dryRun = true;
-    else if (arg === "--no-llm") args.llm = false;
     else if (arg === "--only") {
       args.only = splitList(argv[i + 1] || "");
       i += 1;
@@ -268,10 +264,17 @@ async function main() {
 
   let enrichmentStats = { provider: null, model: null, requested: 0, cached: 0, succeeded: 0, failed: 0, skipped: 0 };
   let enrichmentMap = new Map();
-  // Always invoke when Playwright is enabled — enrichJourneys falls back to
-  // cache-only mode when no API key is present, preserving prior enrichments.
-  const llmEligible = args.llm && plan.enabledTools.includes("playwright");
-  if (llmEligible) {
+  // LLM enrichment is mandatory for the Playwright journey spec. If a repo
+  // would scaffold Playwright but no API key is configured, abort with a
+  // clear error rather than emitting an unenriched skeleton.
+  const playwrightEnabled = plan.enabledTools.includes("playwright");
+  if (playwrightEnabled && !process.env.ANTHROPIC_API_KEY && !process.env.OPENAI_API_KEY) {
+    throw new Error(
+      "LLM enrichment is required when the Playwright stage is enabled. " +
+      "Set ANTHROPIC_API_KEY or OPENAI_API_KEY before running the agent."
+    );
+  }
+  if (playwrightEnabled) {
     const result = await enrichJourneys({
       repoRoot: scan.root,
       journeys,
@@ -300,7 +303,7 @@ async function main() {
     filters: plan.filters,
     mode: args.write ? "write" : "preview",
     enrichment: {
-      enabled: Boolean(llmEligible),
+      enabled: Boolean(playwrightEnabled),
       stats: enrichmentStats,
     },
     crawl: crawlStats,
