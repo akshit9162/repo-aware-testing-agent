@@ -131,6 +131,21 @@ static scan misses (CMS slugs, feature-flagged pages, redirects). The crawler
 uses plain HTTP fetch — SPAs that surface routes only after client-side
 hydration won't be fully covered.
 
+Repair LLM-augmented journey assertions after the app's markup changes:
+
+```sh
+ANTHROPIC_API_KEY=sk-ant-... \
+  node src/cli.js repair playwright-report/journeys.json \
+    --base-url https://staging.example.com --repo /path/to/your/repo --apply
+```
+
+Parses the Playwright results.json, finds tests that failed with locator
+errors, re-fetches the live DOM for each affected route, asks the LLM for
+fresh assertions, and (with `--apply`) surgically replaces the `ENRICHED`
+block in `tests/e2e/user-journeys.spec.ts`. Without `--apply`, only the
+`.qa-agent-cache/llm-enrich/` cache is updated and the next `repo-qa-agent
+<repo> --write` picks up the new assertions.
+
 Import a HAR file (Chrome DevTools → Network → save as HAR) into a Postman
 collection:
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, mergeJourneys, importHar } from "./index.js";
+import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, mergeJourneys, importHar, repair } from "./index.js";
 import { writePlaywrightCoverageExcel } from "./playwrightExcel.js";
 
 const KNOWN_TOOLS = ["playwright", "vitest", "sonarqube", "postman", "trivy", "k6", "axe", "gitleaks", "semgrep", "visual"];
@@ -58,6 +58,14 @@ Subcommands:
                        Import requests from a HAR file (DevTools > Network >
                        export) into a Postman v2.1 collection. Default merges
                        into existing collection, deduping by method+URL.
+  repair <results.json> --base-url <url> [--repo <path>] [--apply]
+                       LLM-driven test repair. Reads a Playwright results.json,
+                       finds tests that failed with locator errors, fetches the
+                       live DOM for each affected route, and asks the LLM for
+                       fresh assertions. With --apply, surgically replaces the
+                       ENRICHED block in tests/e2e/user-journeys.spec.ts.
+                       Without --apply, updates the LLM cache (next agent run
+                       picks up the new assertions).
 `);
 }
 
@@ -113,6 +121,17 @@ function parseArgs(argv) {
   return args;
 }
 
+function parseRepairArgs(argv) {
+  const args = { input: argv[1], baseUrl: null, repoPath: ".", apply: false };
+  for (let i = 2; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--base-url") { args.baseUrl = argv[i + 1]; i += 1; }
+    else if (arg === "--repo") { args.repoPath = argv[i + 1]; i += 1; }
+    else if (arg === "--apply") { args.apply = true; }
+  }
+  return args;
+}
+
 function parseHarArgs(argv) {
   const args = { input: argv[1], outPath: "postman/qa-collection.json", replace: false, filterOrigin: null };
   for (let i = 2; i < argv.length; i += 1) {
@@ -158,6 +177,26 @@ async function main() {
     }
     const summary = await writePlaywrightCoverageExcel(args.inputPath, args.outputPath);
     console.log(JSON.stringify({ output: path.resolve(args.outputPath), summary }, null, 2));
+    return;
+  }
+
+  if (argv[0] === "repair") {
+    const repairArgs = parseRepairArgs(argv);
+    if (!repairArgs.input) {
+      throw new Error("Usage: repo-qa-agent repair <playwright-results.json> --base-url <url> [--repo <path>] [--apply]");
+    }
+    if (!repairArgs.baseUrl) {
+      throw new Error("repair: --base-url is required (the agent fetches the live DOM to ask the LLM for new selectors)");
+    }
+    const repoRoot = path.resolve(repairArgs.repoPath);
+    const result = await repair({
+      resultsPath: path.resolve(repairArgs.input),
+      repoRoot,
+      baseUrl: repairArgs.baseUrl,
+      apply: repairArgs.apply,
+      logger: (msg) => process.stderr.write("[repair] " + msg + "\n"),
+    });
+    console.log(JSON.stringify(result, null, 2));
     return;
   }
 

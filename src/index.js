@@ -12,3 +12,4 @@ export { createTrivyIgnore, discoverSecurityTargets } from "./securityDiscovery.
 export { enrichJourneys } from "./llmEnrich.js";
 export { crawlSite, mergeJourneys } from "./crawler.js";
 export { importHar } from "./harImport.js";
+export { repair, extractRouteFromTitle, patchEnrichedBlock } from "./repair.js";

@@ -191,6 +191,27 @@ for LLM enrichment instead of source code. Catches dynamic routes (CMS
 slugs, feature flags, redirects) and gives assertions against real post-
 hydration text.
 
+### Repair stale LLM-enriched journey tests
+
+When your staging deployment changes its markup and existing
+`tests/e2e/user-journeys.spec.ts` assertions stop matching the DOM, the
+`repair` subcommand reads the Playwright failure report, fetches the
+current HTML for each broken route, asks the LLM for fresh assertions,
+and patches the spec in place:
+
+```sh
+ANTHROPIC_API_KEY=sk-ant-... \
+  node /path/to/agent/src/cli.js repair playwright-report/journeys.json \
+    --base-url https://staging.example.com \
+    --repo /path/to/your/repo \
+    --apply
+```
+
+Without `--apply` it only updates the LLM cache; the next agent
+`--write` run picks up the new assertions. Pairs naturally with
+`--crawl-url` (which performs the equivalent enrichment proactively
+against a known-good baseline).
+
 ### HAR import
 
 After driving your app through Chrome DevTools (Network tab → save as HAR):
