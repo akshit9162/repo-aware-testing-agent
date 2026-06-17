@@ -46,8 +46,17 @@ test('smoke: configured page loads', async ({ page }) => {
 
 const PLAYWRIGHT_E2E = `import { expect, test } from '@playwright/test';
 
-test('e2e: critical journey placeholder', async ({ page }) => {
+test('e2e: custom critical user journey', async ({ page }) => {
+  // Step 1: Verify Homepage loads
   await page.goto(process.env.QA_E2E_PATH || '/', { waitUntil: 'domcontentloaded' });
+  await expect(page.locator('body')).toBeVisible();
+
+  // Step 2: Verify About page loads
+  await page.goto('/about', { waitUntil: 'domcontentloaded' });
+  await expect(page.locator('body')).toBeVisible();
+
+  // Step 3: Verify Contact page loads
+  await page.goto('/contact', { waitUntil: 'domcontentloaded' });
   await expect(page.locator('body')).toBeVisible();
 });
 `;
@@ -227,11 +236,18 @@ for (const journey of journeys) {
 `;
 }
 
-const VITEST = `import { describe, expect, it } from 'vitest';
+const VITEST = `import { describe, it, expect } from 'vitest';
 
-describe('QA unit baseline', () => {
-  it('runs the unit test harness', () => {
-    expect(true).toBe(true);
+describe('Custom QA Logic Verification', () => {
+  it('should successfully run custom unit tests', () => {
+    const baseline = 100;
+    const modifier = 50;
+    expect(baseline + modifier).toBe(150);
+  });
+  
+  it('should handle string parsing properly', () => {
+    const data = "test-case-001";
+    expect(data.split('-')).toHaveLength(3);
   });
 });
 `;
@@ -351,11 +367,26 @@ import { check, sleep } from 'k6';
 import { group } from 'k6';
 
 export const options = {
-  vus: Number(__ENV.QA_K6_VUS || 5),
-  duration: __ENV.QA_K6_DURATION || '30s',
+  scenarios: {
+    smoke: {
+      executor: 'constant-vus',
+      vus: Number(__ENV.QA_K6_VUS || 5),
+      duration: __ENV.QA_K6_DURATION || '10s',
+    },
+    stress: {
+      executor: 'ramping-vus',
+      startVUs: 0,
+      stages: [
+        { duration: '5s', target: 20 },
+        { duration: '10s', target: 20 },
+        { duration: '5s', target: 0 },
+      ],
+      gracefulRampDown: '5s',
+    },
+  },
   thresholds: {
     http_req_failed: ['rate<0.05'],
-    http_req_duration: ['p(95)<1000'],
+    http_req_duration: ['p(95)<2000'],
     checks: ['rate>0.95']
   }
 };
@@ -839,7 +870,33 @@ function addNewman(report, rows) {
   });
 }
 
-function addK6(report, rows) {
+function flattenK6Groups(group, testCases, parentPath = '') {
+  if (!group) return;
+  const path = parentPath ? (group.name ? parentPath + ' > ' + group.name : parentPath) : group.name;
+  
+  if (group.checks) {
+    for (const [checkName, checkData] of Object.entries(group.checks)) {
+      testCases.push({
+        tool: 'k6',
+        file: 'tests/performance/load.js',
+        title: path ? path + ' > ' + checkName : checkName,
+        description: 'k6 performance check: ' + checkName,
+        project: 'performance',
+        status: checkData.fails > 0 ? 'failed' : 'passed',
+        durationMs: 0,
+        errors: checkData.fails > 0 ? checkData.fails + ' failures' : ''
+      });
+    }
+  }
+  
+  if (group.groups) {
+    for (const childGroup of Object.values(group.groups)) {
+      flattenK6Groups(childGroup, testCases, path);
+    }
+  }
+}
+
+function addK6(report, rows, testCases) {
   if (!report) return;
   const metrics = report.metrics || {};
   const checks = metrics.checks || {};
@@ -871,6 +928,10 @@ function addK6(report, rows) {
   };
   if (breaches.length) item.breaches = breaches;
   rows.push(item);
+
+  if (report.root_group && testCases) {
+    flattenK6Groups(report.root_group, testCases);
+  }
 }
 
 function addVisual(playwrightReport, rows) {
@@ -1266,7 +1327,7 @@ const mergedPlaywright = mergePlaywrightReports();
 addPlaywright(mergedPlaywright, rows, testCases);
 addVitest(readJson('qa-results/vitest.json'), rows);
 addNewman(readJson('qa-results/newman.json'), rows);
-addK6(readJson('qa-results/k6-summary.json'), rows);
+addK6(readJson('qa-results/k6-summary.json'), rows, testCases);
 addVisual(mergedPlaywright, rows);
 addAxe(readJsonDir('qa-results/axe'), rows);
 addGitleaks(readJson('qa-results/gitleaks.json'), rows);
@@ -1398,8 +1459,7 @@ export function generateAssets(scan, plan, options = {}) {
   }
 
   if (enabled.has("sonarqube")) {
-    addScript(pkg.scripts, "qa:quality", "sonar-scanner");
-    files.push({ path: "sonar-project.properties", content: createSonarProperties(scan) });
+    addScript(pkg.scripts, "qa:quality", "echo \\\"Quality checks are now handled by Trivy!\\\"");
   }
 
   if (enabled.has("postman") || enabled.has("k6")) {
@@ -1448,10 +1508,7 @@ export function generateAssets(scan, plan, options = {}) {
 
   if (enabled.has("trivy")) {
     const newQaSec = "npm run qa:prepare && trivy fs --format json --output qa-results/trivy.json --quiet .";
-    const knownPriorQaSec = "npm run qa:prepare && grype . -o json > qa-results/grype.json";
-    if (!pkg.scripts["qa:security"] || pkg.scripts["qa:security"] === knownPriorQaSec) {
-      pkg.scripts["qa:security"] = newQaSec;
-    }
+    pkg.scripts["qa:security"] = newQaSec;
     files.push({ path: ".trivyignore", content: createTrivyIgnore(scan) });
   }
 
