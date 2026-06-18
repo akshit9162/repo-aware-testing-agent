@@ -759,11 +759,15 @@ function pct(value) {
 }
 
 function escapeXml(value) {
-  return String(value ?? '')
+  const cleaned = String(value ?? '')
+    .replace(/\\x1B\\[[0-9;]*[a-zA-Z]/g, '')
+    .replace(/[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]/g, '');
+  return cleaned
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
 }
 
 function row(cells) {
@@ -1426,7 +1430,7 @@ export function generateAssets(scan, plan, options = {}) {
   addScript(pkg.scripts, "qa:prepare", "node -e \"require('fs').mkdirSync('qa-results',{recursive:true})\"");
 
   if (enabled.has("playwright")) {
-    const journeys = journeysOverride || discoverUserJourneys(scan.files);
+    const journeys = journeysOverride || discoverUserJourneys(scan.files, { repoRoot: scan.root });
     upgradeScript(pkg.scripts, "qa:smoke",
       "PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results/playwright-smoke.json playwright test tests/smoke",
       [
@@ -1484,7 +1488,7 @@ export function generateAssets(scan, plan, options = {}) {
   }
 
   if (enabled.has("axe") && enabled.has("playwright")) {
-    const journeys = journeysOverride || discoverUserJourneys(scan.files);
+    const journeys = journeysOverride || discoverUserJourneys(scan.files, { repoRoot: scan.root });
     upgradeScript(pkg.scripts, "qa:a11y",
       "PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results/playwright-a11y.json playwright test tests/a11y/qa-a11y.spec.ts",
       [
@@ -1497,7 +1501,7 @@ export function generateAssets(scan, plan, options = {}) {
   }
 
   if (enabled.has("visual") && enabled.has("playwright")) {
-    const journeys = journeysOverride || discoverUserJourneys(scan.files);
+    const journeys = journeysOverride || discoverUserJourneys(scan.files, { repoRoot: scan.root });
     upgradeScript(pkg.scripts, "qa:visual",
       "PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results/playwright-visual.json playwright test tests/visual/qa-visual.spec.ts",
       [

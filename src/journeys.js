@@ -1,3 +1,5 @@
+import { loadFixtures } from "./apiDiscovery.js";
+
 const ROUTE_FILE_RE = /\.(js|jsx|ts|tsx)$/;
 const ROUTE_PARAM_SAMPLE = "sample";
 
@@ -51,16 +53,23 @@ function fromSrcPagesRoute(file) {
   return routeFromSegments(withoutExt.split("/").slice(2));
 }
 
-export function discoverUserJourneys(files) {
+export function discoverUserJourneys(files, options = {}) {
   const routes = new Map();
+  const fixtures = loadFixtures(options.repoRoot);
 
   for (const file of files) {
     const route = fromNextAppRoute(file) || fromNextPagesRoute(file) || fromSrcPagesRoute(file);
     if (!route) continue;
-    routes.set(route, {
-      title: titleForRoute(route),
-      path: route,
-      env: envNameForRoute(route),
+
+    let finalRoute = route;
+    if (fixtures?.routes?.[route]) {
+      finalRoute = fixtures.routes[route];
+    }
+
+    routes.set(finalRoute, {
+      title: titleForRoute(finalRoute),
+      path: finalRoute,
+      env: envNameForRoute(finalRoute),
       source: file,
       dynamic: route.includes(ROUTE_PARAM_SAMPLE),
     });

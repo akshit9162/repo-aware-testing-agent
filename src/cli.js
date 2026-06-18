@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, mergeJourneys, importHar, repair } from "./index.js";
+import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, mergeJourneys, importHar, repair, bootstrapVisual, codingFix, codingFixInWorktree, buildRepoIndex, writeRepoIndex, queryRepoIndex, buildPatchBundle, renderPrMarkdown } from "./index.js";
 import { loadDotenv } from "./loadEnv.js";
 import { writePlaywrightCoverageExcel } from "./playwrightExcel.js";
 
@@ -57,6 +57,10 @@ Subcommands:
                        Import requests from a HAR file (DevTools > Network >
                        export) into a Postman v2.1 collection. Default merges
                        into existing collection, deduping by method+URL.
+  index <repo> [--out <path>] [--query <text>] [--use-embeddings]
+                       Build the repo intelligence cache used by the fixer:
+                       lexical tokens, symbols, routes, imports, selector
+                       hints, API/env refs, and package boundaries.
   repair <results.json> --base-url <url> [--repo <path>] [--apply]
                        LLM-driven test repair. Reads a Playwright results.json,
                        finds tests that failed with locator errors, fetches the
@@ -65,7 +69,13 @@ Subcommands:
                        ENRICHED block in tests/e2e/user-journeys.spec.ts.
                        Without --apply, updates the LLM cache (next agent run
                        picks up the new assertions).
-`);
+  fix <results.json> [--repo <path>] [--apply] [--validate] [--worktree] [--use-embeddings] [--index <path>] [--rebuild-index] [--out <path>] [--bundle-out <path>] [--pr-out <path>]
+                       Coding-agent loop for QA failures. Parses Playwright/
+                       QA JSON, retrieves likely source files, asks the LLM for
+                       exact before/after patches, and applies them only when
+                       --apply is set. Without an API key, emits triage only.
+                       By default writes qa-results/fix-report.json.
+  `);
 }
 
 function parseArgs(argv) {
@@ -125,6 +135,70 @@ function parseRepairArgs(argv) {
     if (arg === "--base-url") { args.baseUrl = argv[i + 1]; i += 1; }
     else if (arg === "--repo") { args.repoPath = argv[i + 1]; i += 1; }
     else if (arg === "--apply") { args.apply = true; }
+  }
+  return args;
+}
+
+function parseFixArgs(argv) {
+  const args = {
+    input: argv[1],
+    repoPath: ".",
+    apply: false,
+    validate: false,
+    classifyOnly: false,
+    changedOnly: false,
+    useEmbeddings: false,
+    outPath: null,
+    bundleOutPath: null,
+    prOutPath: null,
+    indexPath: null,
+    rebuildIndex: false,
+    worktree: false,
+    keepWorktree: false,
+    worktreePath: null,
+    worktreeBranch: null,
+    maxFiles: undefined,
+    maxFailures: undefined,
+    maxAttempts: undefined,
+  };
+  for (let i = 2; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--repo") { args.repoPath = argv[i + 1]; i += 1; }
+    else if (arg === "--apply") { args.apply = true; }
+    else if (arg === "--validate") { args.validate = true; }
+    else if (arg === "--classify-only") { args.classifyOnly = true; }
+    else if (arg === "--changed-only") { args.changedOnly = true; }
+    else if (arg === "--use-embeddings") { args.useEmbeddings = true; }
+    else if (arg === "--out") { args.outPath = argv[i + 1]; i += 1; }
+    else if (arg === "--bundle-out") { args.bundleOutPath = argv[i + 1]; i += 1; }
+    else if (arg === "--pr-out") { args.prOutPath = argv[i + 1]; i += 1; }
+    else if (arg === "--index") { args.indexPath = argv[i + 1]; i += 1; }
+    else if (arg === "--rebuild-index") { args.rebuildIndex = true; }
+    else if (arg === "--worktree") { args.worktree = true; }
+    else if (arg === "--keep-worktree") { args.keepWorktree = true; }
+    else if (arg === "--worktree-path") { args.worktreePath = argv[i + 1]; i += 1; }
+    else if (arg === "--worktree-branch") { args.worktreeBranch = argv[i + 1]; i += 1; }
+    else if (arg === "--max-files") { args.maxFiles = Number(argv[i + 1]); i += 1; }
+    else if (arg === "--max-failures") { args.maxFailures = Number(argv[i + 1]); i += 1; }
+    else if (arg === "--max-attempts") { args.maxAttempts = Number(argv[i + 1]); i += 1; }
+  }
+  return args;
+}
+
+function parseIndexArgs(argv) {
+  const args = {
+    repoPath: argv[1] || ".",
+    outPath: null,
+    query: null,
+    useEmbeddings: false,
+    maxFiles: 8,
+  };
+  for (let i = 2; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--out") { args.outPath = argv[i + 1]; i += 1; }
+    else if (arg === "--query") { args.query = argv[i + 1]; i += 1; }
+    else if (arg === "--use-embeddings") { args.useEmbeddings = true; }
+    else if (arg === "--max-files") { args.maxFiles = Number(argv[i + 1]); i += 1; }
   }
   return args;
 }
@@ -205,6 +279,108 @@ async function main() {
     return;
   }
 
+  if (argv[0] === "index") {
+    const indexArgs = parseIndexArgs(argv);
+    const repoRoot = path.resolve(indexArgs.repoPath);
+    if (repoRoot !== path.resolve(process.cwd())) {
+      await loadDotenv(repoRoot);
+    }
+    let embedder = null;
+    if (indexArgs.useEmbeddings && process.env.OPENAI_API_KEY) {
+      const { default: OpenAI } = await import("openai");
+      embedder = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    }
+    const index = await buildRepoIndex(repoRoot, {
+      useEmbeddings: indexArgs.useEmbeddings,
+      embedder,
+    });
+    const wrote = await writeRepoIndex(repoRoot, index, indexArgs.outPath ? { outPath: indexArgs.outPath } : {});
+    const output = {
+      wrote,
+      repo: index.repo,
+      stats: index.stats,
+    };
+    if (indexArgs.query) {
+      output.matches = queryRepoIndex(index, indexArgs.query, {
+        maxFiles: Number.isFinite(indexArgs.maxFiles) ? indexArgs.maxFiles : 8,
+      }).map((entry) => ({
+        path: entry.path,
+        score: entry.score,
+        role: entry.role,
+        route: entry.route,
+        symbols: entry.symbols.slice(0, 10),
+      }));
+    }
+    console.log(JSON.stringify(output, null, 2));
+    return;
+  }
+
+  if (argv[0] === "fix") {
+    const fixArgs = parseFixArgs(argv);
+    if (!fixArgs.input) {
+      throw new Error("Usage: repo-qa-agent fix <qa-results.json> [--repo <path>] [--apply] [--worktree] [--use-embeddings] [--index <path>] [--rebuild-index] [--out <path>] [--bundle-out <path>] [--pr-out <path>]");
+    }
+    const repoRoot = path.resolve(fixArgs.repoPath);
+    if (repoRoot !== path.resolve(process.cwd())) {
+      await loadDotenv(repoRoot);
+    }
+    let embedder = null;
+    if (fixArgs.useEmbeddings && process.env.OPENAI_API_KEY) {
+      const { default: OpenAI } = await import("openai");
+      embedder = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    }
+    const runFix = fixArgs.worktree ? codingFixInWorktree : codingFix;
+    const result = await runFix({
+      resultsPath: path.resolve(fixArgs.input),
+      repoRoot,
+      apply: fixArgs.apply,
+      validate: fixArgs.validate,
+      classifyOnly: fixArgs.classifyOnly,
+      changedOnly: fixArgs.changedOnly,
+      indexPath: fixArgs.indexPath ? path.resolve(fixArgs.indexPath) : undefined,
+      rebuildIndex: fixArgs.rebuildIndex,
+      useEmbeddings: fixArgs.useEmbeddings,
+      embedder,
+      maxFiles: Number.isFinite(fixArgs.maxFiles) ? fixArgs.maxFiles : undefined,
+      maxFailures: Number.isFinite(fixArgs.maxFailures) ? fixArgs.maxFailures : undefined,
+      maxAttempts: Number.isFinite(fixArgs.maxAttempts) ? fixArgs.maxAttempts : undefined,
+      keepWorktree: fixArgs.keepWorktree,
+      worktreePath: fixArgs.worktreePath ? path.resolve(fixArgs.worktreePath) : undefined,
+      branchName: fixArgs.worktreeBranch || undefined,
+      logger: (msg) => process.stderr.write("[fix] " + msg + "\n"),
+    });
+    const output = JSON.stringify(result, null, 2);
+    const outPath = fixArgs.outPath || path.join(repoRoot, "qa-results", "fix-report.json");
+    await fs.mkdir(path.dirname(path.resolve(outPath)), { recursive: true });
+    await fs.writeFile(outPath, output + "\n", "utf8");
+    const wrote = { report: path.resolve(outPath) };
+    if (fixArgs.bundleOutPath) {
+      const bundle = buildPatchBundle(result);
+      const bundlePath = path.resolve(repoRoot, fixArgs.bundleOutPath);
+      await fs.mkdir(path.dirname(bundlePath), { recursive: true });
+      await fs.writeFile(bundlePath, JSON.stringify(bundle, null, 2) + "\n", "utf8");
+      wrote.bundle = bundlePath;
+    }
+    if (fixArgs.prOutPath) {
+      const bundle = buildPatchBundle(result);
+      const prPath = path.resolve(repoRoot, fixArgs.prOutPath);
+      await fs.mkdir(path.dirname(prPath), { recursive: true });
+      await fs.writeFile(prPath, renderPrMarkdown(result, bundle), "utf8");
+      wrote.pr = prPath;
+    }
+    console.log(JSON.stringify({ wrote, failures: result.failures, applied: result.applied }, null, 2));
+    return;
+  }
+
+  if (argv[0] === "bootstrap-visual") {
+    const repoPath = argv[1] || ".";
+    const result = await bootstrapVisual(repoPath, {
+      logger: (msg) => process.stderr.write(msg + "\n"),
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
   if (argv[0] === "har") {
     const harArgs = parseHarArgs(argv);
     if (!harArgs.input) {
@@ -256,7 +432,7 @@ async function main() {
   const plan = createTestPlan(scan, stack, { only: args.only, skip: args.skip });
 
   // Static journey discovery. May be augmented with live-crawled routes below.
-  let journeys = discoverUserJourneys(scan.files);
+  let journeys = discoverUserJourneys(scan.files, { repoRoot: scan.root });
   let crawlStats = null;
 
   if (args.crawlUrl && plan.enabledTools.includes("playwright")) {

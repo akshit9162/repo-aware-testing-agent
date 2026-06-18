@@ -27,6 +27,25 @@ import {
   loadDotenv,
   summarizePlaywrightReport,
   writePlaywrightCoverageExcel,
+  escapeXml,
+  parseExports,
+  buildServerCommand,
+  parseQaFailures,
+  buildFixIndex,
+  retrieveFixContext,
+  applyExactPatches,
+  buildPatchBundle,
+  rollbackPatchBundle,
+  renderPrMarkdown,
+  codingFixInWorktree,
+  codingFix,
+  classifyFailure,
+  planValidationCommands,
+  runValidationCommands,
+  buildRepoIndex,
+  writeRepoIndex,
+  readRepoIndex,
+  queryRepoIndex,
 } from "../src/index.js";
 
 async function makeFixture() {
@@ -993,4 +1012,516 @@ test("generated QA reporter summarizes all available artifacts", async () => {
   assert.ok(pwCase.testType, "case should carry a test type");
   assert.match(pwCase.prerequisites, /QA_BASE_URL/);
   assert.ok(["Pass", "Fail", "Skipped"].includes(pwCase.status));
+});
+
+test("parseExports correctly extracts named and aliased exports and ignores comments and strings", () => {
+  const code = `
+    // export const DONT_EXTRACT_COMMENT = 1;
+    /* export function DONT_EXTRACT_MULTI() {} */
+    const raw = "export const DONT_EXTRACT_STRING = 2";
+    export async function GET() {}
+    export const POST = () => {};
+    export let PUT = 1, DELETE = 2;
+    export { handler as PATCH };
+    export { OPTIONS };
+  `;
+  const exported = parseExports(code);
+  assert.equal(exported.has("GET"), true);
+  assert.equal(exported.has("POST"), true);
+  assert.equal(exported.has("PUT"), true);
+  assert.equal(exported.has("DELETE"), true);
+  assert.equal(exported.has("PATCH"), true);
+  assert.equal(exported.has("OPTIONS"), true);
+  assert.equal(exported.has("DONT_EXTRACT_COMMENT"), false);
+  assert.equal(exported.has("DONT_EXTRACT_MULTI"), false);
+  assert.equal(exported.has("DONT_EXTRACT_STRING"), false);
+});
+
+test("loadFixtures returns mapped paths from qa-fixtures.json", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-fixtures-"));
+  await fs.writeFile(path.join(dir, "qa-fixtures.json"), JSON.stringify({
+    routes: {
+      "/products/sample": "/products/123-real-product"
+    },
+    api: {
+      "/api/orders/sample": "/api/orders/order_12345"
+    }
+  }));
+
+  const staticJourneys = [{ path: "/products/sample", title: "products > sample", env: "QA_ROUTE_PRODUCTS_PARAM", source: "app/products/[id]/page.tsx" }];
+  const endpointsFiles = ["app/api/orders/[id]/route.ts"];
+
+  const journeys = discoverUserJourneys(["app/products/[id]/page.tsx"], { repoRoot: dir });
+  const endpoints = discoverApiEndpoints(endpointsFiles, { repoRoot: dir });
+
+  const resolvedJourney = journeys.find((j) => j.source === "app/products/[id]/page.tsx");
+  assert.equal(resolvedJourney.path, "/products/123-real-product");
+
+  const resolvedEndpoint = endpoints.find((e) => e.source === "app/api/orders/[id]/route.ts");
+  assert.equal(resolvedEndpoint.path, "/api/orders/order_12345");
+});
+
+test("escapeXml handles invalid control characters and ANSI color sequences", () => {
+  const invalid = "\x1B[31mError:\x1B[0m something went wrong \x08\x00\x1B";
+  const escaped = escapeXml(invalid);
+  assert.equal(escaped.includes("Error:"), true);
+  assert.equal(escaped.includes("something went wrong"), true);
+  assert.equal(escaped.includes("\x1B"), false);
+  assert.equal(escaped.includes("\x00"), false);
+  assert.equal(escaped.includes("&"), false);
+});
+
+test("bootstrap visual passes explicit host and port flags for Vite", () => {
+  const command = buildServerCommand({
+    scripts: { dev: "vite --mode development" },
+    devDependencies: { vite: "^7.0.0" },
+  }, "dev", 4173);
+
+  assert.deepEqual(command.args, ["run", "dev", "--", "--host", "127.0.0.1", "--port", "4173"]);
+  assert.equal(command.env.PORT, "4173");
+  assert.equal(command.env.HOST, "127.0.0.1");
+});
+
+test("bootstrap visual passes explicit host and port flags for Next", () => {
+  const command = buildServerCommand({
+    scripts: { start: "next start" },
+    dependencies: { next: "^15.0.0" },
+  }, "start", 4123);
+
+  assert.deepEqual(command.args, ["run", "start", "--", "-H", "127.0.0.1", "-p", "4123"]);
+  assert.equal(command.env.PORT, "4123");
+  assert.equal(command.env.HOST, "127.0.0.1");
+});
+
+test("parseQaFailures extracts Playwright and QA report failures", () => {
+  const report = {
+    suites: [{
+      title: "root",
+      specs: [{
+        title: "journey: checkout",
+        file: "tests/e2e/user-journeys.spec.ts",
+        tests: [{
+          results: [{ status: "failed", errors: [{ message: "Expected checkout total to be visible" }] }],
+        }],
+      }],
+    }],
+    testCases: [{
+      tool: "vitest",
+      title: "price math",
+      file: "tests/unit/price.test.js",
+      status: "failed",
+      errors: "expected 42",
+    }],
+    qaTestCases: [{
+      testCaseId: "QA-PW-001",
+      summary: "Home page renders",
+      testType: "playwright",
+      status: "Fail",
+      actualResult: "body empty",
+    }],
+  };
+
+  const failures = parseQaFailures(report);
+  assert.equal(failures.length, 3);
+  assert.equal(failures[0].tool, "playwright");
+  assert.match(failures[0].title, /journey: checkout/);
+  assert.equal(failures.find((failure) => failure.tool === "vitest").file, "tests/unit/price.test.js");
+});
+
+test("retrieveFixContext ranks source files by failure terms and embeddings", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-fix-index-"));
+  await fs.mkdir(path.join(dir, "src"), { recursive: true });
+  await fs.writeFile(path.join(dir, "src", "Checkout.tsx"), "export function Checkout(){ return <button>Pay now</button>; }");
+  await fs.writeFile(path.join(dir, "src", "Marketing.tsx"), "export function Marketing(){ return <h1>Hello</h1>; }");
+
+  const index = await buildFixIndex(dir);
+  const failure = { tool: "playwright", title: "checkout pay button missing", error: "Pay now was not visible" };
+  const embedder = async (texts) => texts.map((text) => text.includes("Checkout") || text.includes("checkout") || text.includes("Pay now") ? [1, 0] : [0, 1]);
+  const candidates = await retrieveFixContext(failure, index, {
+    useEmbeddings: true,
+    embedder,
+    maxFiles: 2,
+  });
+
+  assert.equal(candidates[0].path, "src/Checkout.tsx");
+  assert.equal(candidates[0].semantic > 0, true);
+});
+
+test("retrieveFixContext boosts stack trace files and selector source matches", async () => {
+  const index = [
+    {
+      path: "src/components/CheckoutButton.tsx",
+      content: "export function CheckoutButton(){ return <button data-testid=\"checkout-submit\">Pay</button>; }",
+      tokens: ["checkoutbutton", "pay"],
+      role: "component",
+      selectorHints: ["checkout-submit"],
+      symbols: ["CheckoutButton"],
+      api: [],
+      env: [],
+    },
+    {
+      path: "docs/checkout.md",
+      content: "checkout checkout checkout submit button copy",
+      tokens: ["checkout", "submit", "button", "copy"],
+      role: "source",
+      selectorHints: [],
+      symbols: [],
+      api: [],
+      env: [],
+    },
+  ];
+
+  const candidates = await retrieveFixContext({
+    tool: "playwright",
+    title: "checkout submit button",
+    error: "locator('[data-testid=\"checkout-submit\"]') timed out\n    at src/components/CheckoutButton.tsx:7:13",
+  }, index);
+
+  assert.equal(candidates[0].path, "src/components/CheckoutButton.tsx");
+  assert.equal(candidates[0].structural > candidates[0].lexical, true);
+});
+
+test("buildRepoIndex captures routes, symbols, imports, selectors, env, api, and packages", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-index-"));
+  await fs.mkdir(path.join(dir, "apps", "web", "app", "checkout"), { recursive: true });
+  await fs.mkdir(path.join(dir, "apps", "web", "src", "components"), { recursive: true });
+  await fs.mkdir(path.join(dir, "apps", "web", "tests", "e2e"), { recursive: true });
+  await fs.writeFile(path.join(dir, "apps", "web", "app", "checkout", "page.tsx"), [
+    "import { CheckoutButton } from '../../src/components/CheckoutButton';",
+    "export default function CheckoutPage(){ return <CheckoutButton />; }",
+  ].join("\n"));
+  await fs.writeFile(path.join(dir, "apps", "web", "src", "components", "CheckoutButton.tsx"), [
+    "export function CheckoutButton(){",
+    "  const api = process.env.NEXT_PUBLIC_API_URL;",
+    "  fetch('/api/orders');",
+    "  return <button data-testid=\"checkout-submit\" aria-label=\"Submit order\">Pay now</button>;",
+    "}",
+  ].join("\n"));
+  await fs.writeFile(path.join(dir, "apps", "web", "tests", "e2e", "checkout.spec.ts"), [
+    "import { test } from '@playwright/test';",
+    "test('checkout submit', async ({ page }) => {",
+    "  await page.getByTestId('checkout-submit').click();",
+    "});",
+  ].join("\n"));
+
+  const index = await buildRepoIndex(dir);
+  const component = index.entries.find((entry) => entry.path.endsWith("CheckoutButton.tsx"));
+  const route = index.entries.find((entry) => entry.path.endsWith("checkout/page.tsx"));
+  const matches = queryRepoIndex(index, "checkout submit NEXT_PUBLIC_API_URL", { maxFiles: 3 });
+  const outPath = await writeRepoIndex(dir, index);
+  const reloaded = await readRepoIndex(dir);
+
+  assert.equal(route.route, "/checkout");
+  assert.equal(component.role, "component");
+  assert.equal(component.package, "apps/web");
+  assert.equal(component.symbols.includes("CheckoutButton"), true);
+  assert.equal(component.env.includes("NEXT_PUBLIC_API_URL"), true);
+  assert.equal(component.api.includes("/api/orders"), true);
+  assert.equal(component.selectorHints.includes("checkout-submit"), true);
+  assert.equal(index.graph.routeToFiles["/checkout"][0].endsWith("checkout/page.tsx"), true);
+  assert.equal(index.graph.envToFiles.NEXT_PUBLIC_API_URL[0].endsWith("CheckoutButton.tsx"), true);
+  assert.equal(path.basename(outPath), "repo-index.json");
+  assert.equal(reloaded.stats.files, index.stats.files);
+  assert.equal(matches[0].path.endsWith("CheckoutButton.tsx"), true);
+});
+
+test("codingFix uses persisted repo index cache when available", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-cached-index-"));
+  const resultsPath = path.join(dir, "results.json");
+  await fs.writeFile(resultsPath, JSON.stringify({
+    testCases: [{
+      tool: "playwright",
+      title: "checkout submit",
+      file: "tests/e2e/checkout.spec.ts",
+      status: "failed",
+      errors: "getByTestId('checkout-submit') timed out",
+    }],
+  }));
+
+  await writeRepoIndex(dir, {
+    schemaVersion: 1,
+    repo: dir,
+    generatedAt: new Date().toISOString(),
+    stats: { files: 1, routes: 0, imports: 0, packages: 1, embeddings: 0 },
+    graph: {},
+    entries: [{
+      path: "src/CachedCheckout.tsx",
+      role: "component",
+      package: ".",
+      route: null,
+      imports: [],
+      symbols: ["CachedCheckout"],
+      env: [],
+      api: [],
+      selectorHints: ["checkout-submit"],
+      content: "export function CachedCheckout(){ return <button data-testid=\"checkout-submit\" />; }",
+      tokens: ["cachedcheckout", "checkout-submit"],
+    }],
+  });
+
+  const result = await codingFix({ resultsPath, repoRoot: dir, classifyOnly: true });
+
+  assert.equal(result.index.source, "cache");
+  assert.equal(result.index.stats.files, 1);
+  assert.equal(result.fixes[0].candidates[0].path, "src/CachedCheckout.tsx");
+});
+
+test("applyExactPatches only applies exact in-repo replacements", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-apply-patch-"));
+  await fs.mkdir(path.join(dir, "src"), { recursive: true });
+  const file = path.join(dir, "src", "Checkout.tsx");
+  await fs.writeFile(file, "export const label = 'Pay';\n");
+
+  const results = await applyExactPatches(dir, [
+    { path: "src/Checkout.tsx", before: "'Pay'", after: "'Pay now'", reason: "match CTA" },
+    { path: "../outside.js", before: "x", after: "y", reason: "bad path" },
+    { path: "src/Checkout.tsx", before: "missing", after: "nope", reason: "stale patch" },
+  ]);
+
+  assert.equal(results[0].applied, true);
+  assert.equal(results[1].applied, false);
+  assert.equal(results[1].reason, "path outside repo");
+  assert.equal(results[2].applied, false);
+  assert.equal(await fs.readFile(file, "utf8"), "export const label = 'Pay now';\n");
+});
+
+test("codingFix retrieves context, asks fake coding agent, and applies exact patch", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-coding-fix-"));
+  await fs.mkdir(path.join(dir, "src"), { recursive: true });
+  await fs.writeFile(path.join(dir, "src", "Checkout.tsx"), "export function Checkout(){ return <button>Pay</button>; }\n");
+  const resultsPath = path.join(dir, "results.json");
+  await fs.writeFile(resultsPath, JSON.stringify({
+    suites: [{
+      title: "root",
+      specs: [{
+        title: "checkout pay button",
+        file: "tests/e2e/checkout.spec.ts",
+        tests: [{ results: [{ status: "failed", errors: [{ message: "Pay now button not found in Checkout" }] }] }],
+      }],
+    }],
+  }));
+
+  const fakeClient = {
+    messages: {
+      create: async ({ messages }) => {
+        assert.match(messages[0].content, /Checkout\.tsx/);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              summary: "Update checkout CTA label.",
+              patches: [{
+                path: "src/Checkout.tsx",
+                before: "<button>Pay</button>",
+                after: "<button>Pay now</button>",
+                reason: "Test expects the expanded CTA.",
+              }],
+              commands: ["npm test"],
+            }),
+          }],
+        };
+      },
+    },
+  };
+
+  const result = await codingFix({
+    resultsPath,
+    repoRoot: dir,
+    apply: true,
+    client: fakeClient,
+  });
+
+  assert.equal(result.failures, 1);
+  assert.equal(result.fixes[0].patches[0].applied, true);
+  assert.match(await fs.readFile(path.join(dir, "src", "Checkout.tsx"), "utf8"), /Pay now/);
+});
+
+test("patch bundles include rollback data and PR markdown", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-patch-bundle-"));
+  await fs.mkdir(path.join(dir, "src"), { recursive: true });
+  const file = path.join(dir, "src", "Checkout.tsx");
+  await fs.writeFile(file, "export const label = 'Pay';\n");
+  const resultsPath = path.join(dir, "results.json");
+  await fs.writeFile(resultsPath, JSON.stringify({
+    testCases: [{
+      tool: "playwright",
+      title: "checkout label",
+      file: "tests/e2e/checkout.spec.ts",
+      status: "failed",
+      errors: "expected Pay now",
+    }],
+  }));
+
+  const fakeClient = {
+    messages: {
+      create: async () => ({
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            summary: "Update checkout label.",
+            patches: [{ path: "src/Checkout.tsx", before: "'Pay'", after: "'Pay now'", reason: "match CTA expectation" }],
+            commands: [],
+          }),
+        }],
+      }),
+    },
+  };
+
+  const result = await codingFix({ resultsPath, repoRoot: dir, apply: true, client: fakeClient });
+  const bundle = buildPatchBundle(result, { generatedAt: "2026-06-18T00:00:00.000Z" });
+  const markdown = renderPrMarkdown(result, bundle);
+  const rollback = await rollbackPatchBundle(dir, bundle);
+
+  assert.equal(bundle.summary.changes, 1);
+  assert.equal(bundle.changes[0].rollback.before, "'Pay now'");
+  assert.equal(bundle.changes[0].rollback.after, "'Pay'");
+  assert.match(markdown, /QA Agent Fix/);
+  assert.match(markdown, /checkout label/);
+  assert.equal(rollback[0].applied, true);
+  assert.equal(await fs.readFile(file, "utf8"), "export const label = 'Pay';\n");
+});
+
+test("codingFixInWorktree applies patches away from the original repo", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-worktree-origin-"));
+  await fs.mkdir(path.join(dir, "src"), { recursive: true });
+  await fs.writeFile(path.join(dir, "src", "Checkout.tsx"), "export const label = 'Pay';\n");
+  assert.equal(spawnSync("git", ["init"], { cwd: dir }).status, 0);
+  assert.equal(spawnSync("git", ["add", "."], { cwd: dir }).status, 0);
+  assert.equal(spawnSync("git", ["-c", "user.email=qa@example.com", "-c", "user.name=QA Agent", "commit", "-m", "initial"], { cwd: dir }).status, 0);
+
+  const resultsPath = path.join(os.tmpdir(), `repo-qa-worktree-results-${Date.now()}.json`);
+  await fs.writeFile(resultsPath, JSON.stringify({
+    testCases: [{
+      tool: "playwright",
+      title: "checkout label",
+      file: "tests/e2e/checkout.spec.ts",
+      status: "failed",
+      errors: "expected Pay now",
+    }],
+  }));
+
+  const fakeClient = {
+    messages: {
+      create: async () => ({
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            summary: "Update checkout label.",
+            patches: [{ path: "src/Checkout.tsx", before: "'Pay'", after: "'Pay now'", reason: "match CTA expectation" }],
+            commands: [],
+          }),
+        }],
+      }),
+    },
+  };
+
+  const result = await codingFixInWorktree({
+    resultsPath,
+    repoRoot: dir,
+    apply: true,
+    client: fakeClient,
+  });
+
+  assert.equal(result.worktree.enabled, true);
+  assert.equal(result.worktree.kept, false);
+  assert.equal(result.fixes[0].patches[0].applied, true);
+  assert.equal(await fs.readFile(path.join(dir, "src", "Checkout.tsx"), "utf8"), "export const label = 'Pay';\n");
+  await assert.rejects(fs.stat(result.worktree.path));
+});
+
+test("classifyFailure labels common QA failure types", () => {
+  assert.equal(
+    classifyFailure({ tool: "playwright", error: "locator.getByRole timed out: element is not visible" }).type,
+    "selector-or-dom-drift",
+  );
+  assert.equal(
+    classifyFailure({ tool: "trivy", error: "CVE-2026-123 critical vulnerability" }).type,
+    "security-finding",
+  );
+  assert.equal(
+    classifyFailure({ error: "QA_BASE_URL not set and connection refused" }).type,
+    "environment-or-fixture",
+  );
+});
+
+test("planValidationCommands picks narrow safe validation commands", () => {
+  const playwright = planValidationCommands({ tool: "playwright", file: "tests/e2e/checkout.spec.ts" });
+  const vitest = planValidationCommands({ tool: "vitest", file: "tests/unit/price.test.js" }, {
+    commands: ["rm -rf .", "npm run qa:unit"],
+  });
+
+  assert.deepEqual(playwright, ["npx playwright test tests/e2e/checkout.spec.ts"]);
+  assert.equal(vitest.includes("npm run qa:unit"), true);
+  assert.equal(vitest.includes("rm -rf ."), false);
+});
+
+test("runValidationCommands executes safe commands and reports status", async () => {
+  const results = await runValidationCommands(["node -e \"process.exit(0)\""], { cwd: process.cwd() });
+  assert.equal(results.length, 1);
+  assert.equal(results[0].ok, true);
+});
+
+test("codingFix classify-only returns classifications without proposals", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-classify-only-"));
+  await fs.mkdir(path.join(dir, "src"), { recursive: true });
+  await fs.writeFile(path.join(dir, "src", "Checkout.tsx"), "export function Checkout(){ return <main/>; }\n");
+  const resultsPath = path.join(dir, "results.json");
+  await fs.writeFile(resultsPath, JSON.stringify({
+    testCases: [{
+      tool: "playwright",
+      title: "checkout route",
+      file: "tests/e2e/checkout.spec.ts",
+      status: "failed",
+      errors: "getByRole button not found",
+    }],
+  }));
+
+  const result = await codingFix({ resultsPath, repoRoot: dir, classifyOnly: true });
+  assert.equal(result.classifyOnly, true);
+  assert.equal(result.fixes[0].classification.type, "selector-or-dom-drift");
+  assert.equal(result.fixes[0].attempts.length, 0);
+  assert.equal(result.fixes[0].proposal.patches.length, 0);
+});
+
+test("codingFix validate records validation commands and results", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-qa-validate-"));
+  await fs.mkdir(path.join(dir, "src"), { recursive: true });
+  await fs.writeFile(path.join(dir, "src", "Checkout.tsx"), "export const label = 'Pay';\n");
+  const resultsPath = path.join(dir, "results.json");
+  await fs.writeFile(resultsPath, JSON.stringify({
+    testCases: [{
+      tool: "custom",
+      title: "checkout label",
+      file: "",
+      status: "failed",
+      errors: "expected Pay now",
+    }],
+  }));
+
+  const fakeClient = {
+    messages: {
+      create: async () => ({
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            summary: "Update label.",
+            patches: [{ path: "src/Checkout.tsx", before: "'Pay'", after: "'Pay now'", reason: "match test expectation" }],
+            commands: ["node -e \"process.exit(0)\""],
+          }),
+        }],
+      }),
+    },
+  };
+
+  const result = await codingFix({
+    resultsPath,
+    repoRoot: dir,
+    apply: true,
+    validate: true,
+    client: fakeClient,
+  });
+
+  assert.equal(result.validate, true);
+  assert.equal(result.fixes[0].attempts[0].validationOk, true);
+  assert.equal(result.fixes[0].attempts[0].validation[0].ok, true);
 });

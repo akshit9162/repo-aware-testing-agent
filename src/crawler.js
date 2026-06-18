@@ -113,12 +113,38 @@ export async function crawlSite(baseUrl, {
   const visitedUrls = new Set();
   const queue = [{ url: base.toString(), level: 0, foundOn: null }];
 
-  while (queue.length && discovered.size < maxPages) {
-    const batch = queue.splice(0, concurrency);
-    await Promise.all(batch.map(async ({ url, level, foundOn }) => {
-      if (visitedUrls.has(url) || discovered.size >= maxPages) return;
-      visitedUrls.add(url);
+  let activeCount = 0;
 
+  return new Promise((resolve, reject) => {
+    function processQueue() {
+      if (discovered.size >= maxPages) {
+        if (activeCount === 0) resolve(finish());
+        return;
+      }
+
+      while (activeCount < concurrency && queue.length > 0 && discovered.size < maxPages) {
+        const item = queue.shift();
+        if (visitedUrls.has(item.url)) continue;
+        visitedUrls.add(item.url);
+
+        activeCount += 1;
+        crawlOne(item)
+          .then(() => {
+            activeCount -= 1;
+            processQueue();
+          })
+          .catch(() => {
+            activeCount -= 1;
+            processQueue();
+          });
+      }
+
+      if (activeCount === 0 && queue.length === 0) {
+        resolve(finish());
+      }
+    }
+
+    async function crawlOne({ url, level, foundOn }) {
       let response;
       try {
         response = await fetchWithTimeout(url, timeoutMs);
@@ -141,7 +167,7 @@ export async function crawlSite(baseUrl, {
       const path = normalizePath(finalUrl);
       if (!path || ASSET_EXT.test(path)) return;
 
-      if (!discovered.has(path)) {
+      if (!discovered.has(path) && discovered.size < maxPages) {
         const record = {
           path,
           title: extractTitle(html),
@@ -161,13 +187,21 @@ export async function crawlSite(baseUrl, {
       for (const link of extractLinks(html, finalUrl)) {
         if (!isSameOrigin(link, base.toString())) continue;
         if (visitedUrls.has(link)) continue;
-        if (ASSET_EXT.test(new URL(link).pathname || "")) continue;
+        try {
+          if (ASSET_EXT.test(new URL(link).pathname || "")) continue;
+        } catch {
+          continue;
+        }
         queue.push({ url: link, level: level + 1, foundOn: path });
       }
-    }));
-  }
+    }
 
-  return [...discovered.values()].sort((a, b) => a.path.localeCompare(b.path));
+    function finish() {
+      return [...discovered.values()].sort((a, b) => a.path.localeCompare(b.path));
+    }
+
+    processQueue();
+  });
 }
 
 /**

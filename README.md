@@ -17,6 +17,11 @@ A standalone QA automation agent that scans a repository and generates a customi
 
 It inspects the target repo, builds a risk-aware test plan, then optionally writes starter configs, test files, Postman collections, k6 scripts, and `package.json` QA scripts.
 
+The product direction is captured in
+[docs/BEST_IN_MARKET_ROADMAP.md](./docs/BEST_IN_MARKET_ROADMAP.md): the goal is
+not generic code assistance, but a QA-native loop that turns reproducible
+failures into reviewed, validated source fixes.
+
 Unit tests are generated from the repo scan. The agent creates a baseline Vitest harness plus a repo-specific regression manifest that checks detected package scripts, source files, UI routes, API files, component files, config files, and environment contract files.
 
 API tests are generated from detected API route files such as `pages/api/**`, `app/api/**/route.ts`, and `src/routes/**`. The Postman collection validates server-error status, response time, and JSON parseability when JSON is advertised. SonarQube configuration is generated from detected source/test folders with LCOV coverage and common build/report exclusions.
@@ -149,6 +154,38 @@ fresh assertions, and (with `--apply`) surgically replaces the `ENRICHED`
 block in `tests/e2e/user-journeys.spec.ts`. Without `--apply`, only the
 `.qa-agent-cache/llm-enrich/` cache is updated and the next `repo-qa-agent
 <repo> --write` picks up the new assertions.
+
+Run the coding fix agent on QA failures:
+
+```sh
+node src/cli.js index /path/to/your/repo --query "checkout submit button"
+
+ANTHROPIC_API_KEY=sk-ant-... \
+  node src/cli.js fix qa-results/qa-report.json --repo /path/to/your/repo --out qa-results/fix-report.json
+
+ANTHROPIC_API_KEY=sk-ant-... \
+  node src/cli.js fix qa-results/qa-report.json --repo /path/to/your/repo --apply --validate \
+    --worktree --bundle-out qa-results/fix-bundle.json --pr-out qa-results/fix-pr.md
+```
+
+`index` builds `.qa-agent-cache/repo-index.json`, a repo intelligence cache with
+lexical tokens, exported symbols, route hints, imports, selector hints, API/env
+dependencies, and monorepo package boundaries. Add `--use-embeddings` to include
+OpenAI embeddings in the cache when `OPENAI_API_KEY` is available.
+
+`fix` parses Playwright/QA JSON failures, retrieves likely source files, asks
+the LLM for minimal exact before/after replacements, and applies them only when
+`--apply` is set. Without an API key it still emits a triage report with likely
+files. Add `--use-embeddings` to rerank candidates with OpenAI embeddings when
+`OPENAI_API_KEY` is available; otherwise the retriever uses fast lexical scoring.
+When `.qa-agent-cache/repo-index.json` exists, `fix` loads it automatically;
+use `--index <path>` to point at a specific cache or `--rebuild-index` to ignore
+the cache and rebuild in memory. Retrieval combines lexical, semantic, selector,
+route, and stack-trace signals. Add `--bundle-out` for a machine-readable patch
+bundle with rollback replacements and `--pr-out` for a review-ready PR body.
+Add `--worktree` to run the patch and validation loop in a disposable git
+worktree so the original checkout stays untouched; use `--keep-worktree` when
+you want to inspect the patched worktree after the run.
 
 Import a HAR file (Chrome DevTools → Network → save as HAR) into a Postman
 collection:

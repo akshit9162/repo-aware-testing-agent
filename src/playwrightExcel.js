@@ -1,12 +1,17 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-function escapeXml(value) {
-  return String(value ?? "")
+export function escapeXml(value) {
+  const cleaned = String(value ?? "")
+    .replace(/\x1B\[[0-9;]*[a-zA-Z]/g, "")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+
+  return cleaned
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
 }
 
 function statusForTest(test) {
