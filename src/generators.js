@@ -1,6 +1,10 @@
-import { discoverUserJourneys } from "./journeys.js";
+import { discoverUserJourneys, discoverBackendEndpoints } from "./journeys.js";
 import { discoverUnitTestTargets } from "./unitDiscovery.js";
 import { discoverApiEndpoints } from "./apiDiscovery.js";
+import { buildFixtureExample } from "./fixtureAutogen.js";
+import { annotateJourneysWithForms } from "./formFieldDiscovery.js";
+import { annotateJourneysWithApiCalls, aggregateApiCallsFromJourneys } from "./apiCallDiscovery.js";
+import { buildWalkerAssets } from "./journeyClustering.js";
 import { createSonarProperties } from "./sonarDiscovery.js";
 import { createTrivyIgnore } from "./securityDiscovery.js";
 
@@ -52,6 +56,54 @@ test('e2e: critical journey placeholder', async ({ page }) => {
 });
 `;
 
+const JOURNEY_FIXTURE_HELPER = `import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+
+/**
+ * Loads tests/fixtures/qa-uat.local.json if present (gitignored, real values),
+ * falling back to qa-uat.local.json.example (committed scaffold).
+ * Specs use this to substitute :param values, base URLs, and auth/upload data
+ * without ever embedding real PII in the committed test code.
+ */
+const LOCAL = path.join(process.cwd(), 'tests/fixtures/qa-uat.local.json');
+const EXAMPLE = path.join(process.cwd(), 'tests/fixtures/qa-uat.local.json.example');
+
+function readJson(filePath) {
+  try {
+    return JSON.parse(readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export const FIXTURE = existsSync(LOCAL)
+  ? readJson(LOCAL)
+  : existsSync(EXAMPLE) ? readJson(EXAMPLE) : null;
+
+export const HAS_REAL_FIXTURE = existsSync(LOCAL);
+
+/** Replace :paramName placeholders in a route with fixture-supplied values. */
+export function substituteParams(routePath, params = FIXTURE?.routeParams || {}) {
+  return routePath.replace(/:(\\w+)(\\?)?/g, (_, name, optional) => {
+    const value = params[name];
+    if (value === undefined || value === null) return optional ? '' : 'sample';
+    return String(value);
+  }).replace(/\\/+/g, '/').replace(/\\/$/, '') || '/';
+}
+
+/** Base URL with sensible fallback chain. */
+export function baseUrl() {
+  return process.env.QA_BASE_URL || FIXTURE?.uatUrl || 'http://localhost:3000';
+}
+
+/** Full URL for a discovered journey path. */
+export function urlFor(routePath) {
+  const base = baseUrl().replace(/\\/$/, '');
+  const expanded = substituteParams(routePath);
+  return expanded === '/' ? base + '/' : base + expanded;
+}
+`;
+
 function createPlaywrightJourneySpec(journeys, enrichment = new Map()) {
   const rows = journeys.map((journey) => ({
     title: journey.title,
@@ -65,6 +117,7 @@ function createPlaywrightJourneySpec(journeys, enrichment = new Map()) {
   for (const [route, value] of enrichment) enrichedObj[route] = value;
 
   return `import { expect, test } from '@playwright/test';
+import { urlFor } from '../helpers/journey-fixture';
 
 const journeys = ${JSON.stringify(rows, null, 2)};
 
@@ -130,7 +183,7 @@ async function exerciseVisibleFormControls(page) {
 
 for (const journey of journeys) {
   test(\`journey: \${journey.title}\`, async ({ page }) => {
-    const path = process.env[journey.env] || journey.path;
+    const path = process.env[journey.env] || urlFor(journey.path);
     await page.goto(path, { waitUntil: 'domcontentloaded' });
     await expect(page.locator('body')).toBeVisible();
     const enriched = ENRICHED[journey.path];
@@ -148,6 +201,7 @@ for (const journey of journeys) {
 function createVisualSpec(journeys) {
   const rows = journeys.map((journey) => ({ title: journey.title, path: journey.path, env: journey.env }));
   return `import { expect, test } from '@playwright/test';
+import { urlFor } from '../helpers/journey-fixture';
 
 const journeys = ${JSON.stringify(rows, null, 2)};
 
@@ -166,7 +220,7 @@ const maxDiffPixelRatio = Number(process.env.QA_VISUAL_MAX_DIFF_RATIO || 0.01);
 
 for (const journey of journeys) {
   test(\`visual: \${journey.title}\`, async ({ page }) => {
-    const targetPath = process.env[journey.env] || journey.path;
+    const targetPath = process.env[journey.env] || urlFor(journey.path);
     await page.goto(targetPath, { waitUntil: 'networkidle' });
     await page.waitForLoadState('domcontentloaded');
     // Hide caret + disable animations to keep baselines stable.
@@ -188,6 +242,7 @@ function createAxeSpec(journeys) {
 import AxeBuilder from '@axe-core/playwright';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { urlFor } from '../helpers/journey-fixture';
 
 const journeys = ${JSON.stringify(rows, null, 2)};
 
@@ -204,7 +259,7 @@ function slug(routePath) {
 
 for (const journey of journeys) {
   test(\`a11y: \${journey.title}\`, async ({ page }) => {
-    const targetPath = process.env[journey.env] || journey.path;
+    const targetPath = process.env[journey.env] || urlFor(journey.path);
     await page.goto(targetPath, { waitUntil: 'domcontentloaded' });
     const results = await new AxeBuilder({ page }).analyze();
     writeFileSync(
@@ -1431,6 +1486,10 @@ export function generateAssets(scan, plan, options = {}) {
 
   if (enabled.has("playwright")) {
     const journeys = journeysOverride || discoverUserJourneys(scan.files, { repoRoot: scan.root });
+    // Enrich each journey with discovered form fields + API calls so the
+    // LLM prompt + generated specs both have richer context.
+    annotateJourneysWithForms(journeys, scan.root);
+    annotateJourneysWithApiCalls(journeys, scan.root);
     upgradeScript(pkg.scripts, "qa:smoke",
       "PLAYWRIGHT_JSON_OUTPUT_FILE=qa-results/playwright-smoke.json playwright test tests/smoke",
       [
@@ -1454,6 +1513,26 @@ export function generateAssets(scan, plan, options = {}) {
     files.push({ path: "tests/smoke/qa-smoke.spec.ts", content: PLAYWRIGHT_SMOKE });
     files.push({ path: "tests/e2e/critical-journey.spec.ts", content: PLAYWRIGHT_E2E });
     files.push({ path: "tests/e2e/user-journeys.spec.ts", content: createPlaywrightJourneySpec(journeys, enrichment) });
+    files.push({
+      path: "tests/helpers/journey-fixture.ts",
+      content: JOURNEY_FIXTURE_HELPER,
+    });
+
+    // Fixture autogen: when discovered routes contain dynamic params, auth
+    // pages, or upload pages, emit a gitignored .example so the next human
+    // run has the slots ready to fill.
+    const fixtureAsset = buildFixtureExample({ journeys, stack: plan.stack || {}, scan });
+    if (fixtureAsset) {
+      files.push({ path: fixtureAsset.path, content: fixtureAsset.contents });
+    }
+
+    // Multi-stage walker autogen: when journeys cluster into a recognizable
+    // funnel (entry → info → options → ... → success), emit a per-cluster
+    // walkTo() helper. Saves the user the manual wiring I had to do for
+    // the Tameen motor flow.
+    for (const walker of buildWalkerAssets(journeys)) {
+      files.push({ path: walker.path, content: walker.content });
+    }
   }
 
   if (enabled.has("vitest")) {
@@ -1474,7 +1553,26 @@ export function generateAssets(scan, plan, options = {}) {
   }
 
   if (enabled.has("postman") || enabled.has("k6")) {
-    const endpoints = discoverApiEndpoints(scan.files, { repoRoot: scan.root });
+    const baseEndpoints = discoverApiEndpoints(scan.files, { repoRoot: scan.root });
+    const baseBackend = discoverBackendEndpoints(scan.files, scan.root);
+    // Aggregate frontend-discovered calls into the endpoint set so Postman/k6
+    // also exercise URLs the SPA actually hits at runtime.
+    const sharedJourneys =
+      journeysOverride
+      || (enabled.has("playwright") ? null : annotateJourneysWithApiCalls(
+          discoverUserJourneys(scan.files, { repoRoot: scan.root }),
+          scan.root
+        ));
+    const frontCalls = sharedJourneys ? aggregateApiCallsFromJourneys(sharedJourneys) : [];
+    const merged = [...baseEndpoints];
+    const seen = new Set(merged.map((e) => `${e.method || "GET"} ${e.path}`));
+    for (const e of [...baseBackend, ...frontCalls]) {
+      const key = `${e.method || "GET"} ${e.path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(e);
+    }
+    const endpoints = merged;
     if (enabled.has("postman")) {
       addScript(pkg.scripts, "qa:api", "npm run qa:prepare && newman run postman/qa-collection.json -e postman/qa-env.json --reporters cli,json --reporter-json-export qa-results/newman.json");
       addDevDependency(deps, "newman", "^6.2.1");

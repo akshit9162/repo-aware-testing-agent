@@ -1,3 +1,5 @@
+import { discoverBackendEndpoints } from "./journeys.js";
+
 function hasDep(pkg, name) {
   return Boolean(pkg?.dependencies?.[name] || pkg?.devDependencies?.[name]);
 }
@@ -56,16 +58,27 @@ export function detectStack(scan) {
   const lang = detectLanguage(scan);
   const isJsTs = lang.primary === "typescript" || lang.primary === "javascript";
 
+  // Additional API signal: scan Express/Fastify/Koa-style route declarations.
+  // Cheap to run (parses only known server file locations); lets the planner
+  // enable Postman/k6 stages for backend repos that lack an OpenAPI spec.
+  let backendEndpointCount = 0;
+  try {
+    backendEndpointCount = discoverBackendEndpoints(files, scan.root).length;
+  } catch {
+    backendEndpointCount = 0;
+  }
+
   return {
     packageManager,
     framework,
     language: lang.primary,
     languages: lang.languages,
     hasFrontend: scan.facts.hasReactFiles || ["next", "vite", "react"].includes(framework),
-    hasApi: scan.facts.hasApiRoutes || scan.facts.hasOpenApi,
+    hasApi: scan.facts.hasApiRoutes || scan.facts.hasOpenApi || backendEndpointCount > 0,
     hasContainer: scan.facts.hasDockerfile,
     hasUnitTestSignal: Boolean(scan.facts.hasUnitTestSignal),
     isJsTs,
     existingTools,
+    backendEndpointCount,
   };
 }

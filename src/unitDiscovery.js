@@ -1,5 +1,5 @@
 const SOURCE_RE = /\.(js|jsx|ts|tsx|mjs|cjs)$/;
-const TEST_RE = /(\.test\.|\.spec\.|__tests__\/|\/tests?\/)/;
+const TEST_RE = /(\.test\.|\.spec\.|__tests__\/|(^|\/)tests?\/)/;
 
 const QA_SCAFFOLD_PATHS = new Set([
   "playwright.config.ts",

@@ -119,6 +119,13 @@ test("scans repo and generates customized QA assets", async () => {
   const journeySpec = assets.files.find((file) => file.path === "tests/e2e/user-journeys.spec.ts");
   assert.match(journeySpec.content, /"title": "checkout"/);
   assert.match(journeySpec.content, /QA_ROUTE_PRODUCTS_PARAM/);
+  assert.match(journeySpec.content, /import \{ urlFor \} from '\.\.\/helpers\/journey-fixture'/);
+  assert.match(journeySpec.content, /urlFor\(journey\.path\)/);
+  assert.equal(assets.files.some((file) => file.path === "tests/helpers/journey-fixture.ts"), true);
+  const a11ySpec = assets.files.find((file) => file.path === "tests/a11y/qa-a11y.spec.ts");
+  assert.match(a11ySpec.content, /urlFor\(journey\.path\)/);
+  const visualSpec = assets.files.find((file) => file.path === "tests/visual/qa-visual.spec.ts");
+  assert.match(visualSpec.content, /urlFor\(journey\.path\)/);
 });
 
 test("discovers API endpoints from scanned route files", async () => {
@@ -202,6 +209,29 @@ test("applies assets without overwriting existing files", async () => {
   assert.equal(result.written.includes("package.json"), true);
   assert.equal(result.skipped.includes("tests/unit/qa-baseline.test.js"), true);
   assert.equal(await fs.readFile(path.join(dir, "tests", "unit", "qa-baseline.test.js"), "utf8"), "keep");
+});
+
+test("applyAssets appends generated QA fixture entries to gitignore", async () => {
+  const dir = await makeFixture();
+  await fs.writeFile(path.join(dir, ".gitignore"), "node_modules\n", "utf8");
+  const pkg = JSON.parse(await fs.readFile(path.join(dir, "package.json"), "utf8"));
+  await applyAssets(dir, {
+    packageJson: `${JSON.stringify(pkg, null, 2)}\n`,
+    files: [{
+      path: "tests/fixtures/qa-uat.local.json.example",
+      content: "{}\n",
+      appendGitignore: [
+        "# QA fixtures with real UAT data / PII",
+        "tests/fixtures/*.local.json",
+        "tests/fixtures/sample-*",
+        ".qa-agent-cache/",
+      ],
+    }],
+  });
+  const gitignore = await fs.readFile(path.join(dir, ".gitignore"), "utf8");
+
+  assert.match(gitignore, /tests\/fixtures\/\*\.local\.json/);
+  assert.match(gitignore, /\.qa-agent-cache\//);
 });
 
 test("generates an Excel-compatible Playwright report", async () => {
@@ -1524,4 +1554,402 @@ test("codingFix validate records validation commands and results", async () => {
   assert.equal(result.validate, true);
   assert.equal(result.fixes[0].attempts[0].validationOk, true);
   assert.equal(result.fixes[0].attempts[0].validation[0].ok, true);
+});
+
+import {
+  parseRouteDeclarations,
+  buildImportMap,
+  resolveImportToFile,
+  expandRoutePath,
+  discoverReactRouterJourneys,
+  parseVueRouteEntries,
+  discoverVueRouterJourneys,
+  parseHttpRouteCalls,
+  discoverBackendJourneys,
+  buildFixtureExample,
+} from "../src/index.js";
+
+test("expandRoutePath substitutes :params with sample values and collapses optionals", () => {
+  assert.deepEqual(expandRoutePath("/:lang?/:insuranceType/:channel/motor-basic-form"), {
+    path: "/motor-insurance/main/motor-basic-form",
+    params: ["lang", "insuranceType", "channel"],
+    dynamic: true,
+  });
+  assert.deepEqual(expandRoutePath("/static-page"), {
+    path: "/static-page",
+    params: [],
+    dynamic: false,
+  });
+  assert.equal(expandRoutePath("/:id").path, "/1");
+});
+
+test("parseRouteDeclarations extracts <Route path=... element/component=...> attrs (absolute paths, catch-all skipped)", () => {
+  const source = `
+    <Route exact path="home" element={<LandingPage />}/>
+    <Route path="blogs/:slug" element={<BlogDetail />}/>
+    <PublicRoute path='/term/:channel' component={HomePage} />
+    <Route path="*" element={<NotFound/>} />
+  `;
+  const decls = parseRouteDeclarations(source);
+  assert.deepEqual(
+    decls.map((d) => ({ rawPath: d.rawPath, componentName: d.componentName })),
+    [
+      { rawPath: "/home", componentName: "LandingPage" },
+      { rawPath: "/blogs/:slug", componentName: "BlogDetail" },
+      { rawPath: "/term/:channel", componentName: "HomePage" },
+    ]
+  );
+});
+
+test("parseRouteDeclarations inherits parent <Route path> into nested children", () => {
+  const source = `
+    <Route path="/:lang?">
+      <Route path="dashboard" element={<Dashboard/>}>
+        <Route path="users" element={<UserList/>} />
+        <Route path="users/:id" element={<UserDetail/>} />
+      </Route>
+      <Route path="login" element={<Login/>}/>
+    </Route>
+  `;
+  const decls = parseRouteDeclarations(source);
+  const paths = decls.map((d) => d.rawPath).sort();
+  assert.deepEqual(paths, [
+    "/:lang?/dashboard",
+    "/:lang?/dashboard/users",
+    "/:lang?/dashboard/users/:id",
+    "/:lang?/login",
+  ]);
+});
+
+test("buildImportMap captures default, named, and lazy/ReactLazyPreload imports", () => {
+  const source = `
+    import Foo from './Foo';
+    import { Bar } from './Bar';
+    const Baz = lazy(() => import('./Baz/Baz'));
+    const Qux = ReactLazyPreload(() => import('./Pages/Qux/Qux'));
+  `;
+  const map = buildImportMap(source);
+  assert.equal(map.get("Foo"), "./Foo");
+  assert.equal(map.get("Bar"), "./Bar");
+  assert.equal(map.get("Baz"), "./Baz/Baz");
+  assert.equal(map.get("Qux"), "./Pages/Qux/Qux");
+});
+
+test("resolveImportToFile tries common extensions and index files", () => {
+  const files = new Set([
+    "src/Routes/index.jsx",
+    "src/Pages/MotorBasicForm/MotorBasicForm.jsx",
+    "src/Pages/HomePage/index.tsx",
+  ]);
+  assert.equal(
+    resolveImportToFile("src/Routes/index.jsx", "../Pages/MotorBasicForm/MotorBasicForm", files),
+    "src/Pages/MotorBasicForm/MotorBasicForm.jsx"
+  );
+  assert.equal(
+    resolveImportToFile("src/Routes/index.jsx", "../Pages/HomePage", files),
+    "src/Pages/HomePage/index.tsx"
+  );
+  assert.equal(
+    resolveImportToFile("src/Routes/index.jsx", "../Pages/Missing", files),
+    null
+  );
+});
+
+test("discoverReactRouterJourneys finds CRA-style routes against a fixture repo", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-rrr-"));
+  await fs.mkdir(path.join(dir, "src/Routes"), { recursive: true });
+  await fs.mkdir(path.join(dir, "src/Pages/MotorBasicForm"), { recursive: true });
+  await fs.mkdir(path.join(dir, "src/Pages/LandingPage"), { recursive: true });
+  await fs.writeFile(
+    path.join(dir, "src/Routes/index.jsx"),
+    `
+    import { Route, Routes } from 'react-router-dom';
+    const LandingPage = ReactLazyPreload(() => import('../Pages/LandingPage/LandingPage'));
+    const MotorBasicForm = ReactLazyPreload(() => import('../Pages/MotorBasicForm/MotorBasicForm'));
+    export default function App() {
+      return (
+        <Routes>
+          <Route path="/:lang?">
+            <Route exact path="home" element={<LandingPage />} />
+            <Route path=":insuranceType/:channel/motor-basic-form" element={<MotorBasicForm />} />
+          </Route>
+        </Routes>
+      );
+    }`,
+    "utf8"
+  );
+  await fs.writeFile(path.join(dir, "src/Pages/LandingPage/LandingPage.jsx"), "export default function L(){return null;}", "utf8");
+  await fs.writeFile(path.join(dir, "src/Pages/MotorBasicForm/MotorBasicForm.jsx"), "export default function M(){return null;}", "utf8");
+  const files = ["src/Routes/index.jsx", "src/Pages/LandingPage/LandingPage.jsx", "src/Pages/MotorBasicForm/MotorBasicForm.jsx"];
+  const journeys = discoverReactRouterJourneys(files, dir);
+  const paths = journeys.map((j) => j.path).sort();
+  assert.deepEqual(paths, ["/home", "/motor-insurance/main/motor-basic-form"]);
+  const motor = journeys.find((j) => j.path === "/motor-insurance/main/motor-basic-form");
+  assert.equal(motor.source, "src/Pages/MotorBasicForm/MotorBasicForm.jsx");
+  assert.equal(motor.framework, "react-router");
+  // The stack-based parser inherits parent <Route path="/:lang?"> into the
+  // child path, so all three params show up here.
+  assert.deepEqual(motor.params, ["lang", "insuranceType", "channel"]);
+});
+
+test("discoverUserJourneys integrates React Router declarations into the journey list", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-uj-"));
+  await fs.mkdir(path.join(dir, "src/Routes"), { recursive: true });
+  await fs.mkdir(path.join(dir, "src/Pages/AboutUs"), { recursive: true });
+  await fs.writeFile(
+    path.join(dir, "src/Routes/index.jsx"),
+    `import {Route} from 'react-router-dom';
+     import AboutUs from '../Pages/AboutUs/AboutUs';
+     export default () => (<><Route exact path="about-us" element={<AboutUs/>}/></>);`,
+    "utf8"
+  );
+  await fs.writeFile(path.join(dir, "src/Pages/AboutUs/AboutUs.jsx"), "export default ()=>null;", "utf8");
+  const scan = await scanRepository(dir);
+  const journeys = discoverUserJourneys(scan.files, { repoRoot: scan.root });
+  const paths = journeys.map((j) => j.path);
+  assert.ok(paths.includes("/about-us"), "expected /about-us in journeys: " + paths.join(","));
+  const aboutUs = journeys.find((j) => j.path === "/about-us");
+  assert.equal(aboutUs.source, "src/Pages/AboutUs/AboutUs.jsx");
+});
+
+test("parseVueRouteEntries finds path/component pairs from a router config", () => {
+  const source = `
+    export const routes = [
+      { path: '/', component: Home },
+      { path: '/users/:id', component: () => import('./UserDetail.vue') },
+    ];
+  `;
+  const entries = parseVueRouteEntries(source);
+  assert.deepEqual(entries.map((e) => ({ rawPath: e.rawPath, componentName: e.componentName, inlineImport: e.inlineImport })), [
+    { rawPath: "/", componentName: "Home", inlineImport: null },
+    { rawPath: "/users/:id", componentName: null, inlineImport: "./UserDetail.vue" },
+  ]);
+});
+
+test("parseHttpRouteCalls finds Express-style verb declarations", () => {
+  const source = `
+    app.get('/users', listUsers);
+    app.post('/orders/:id', placeOrder);
+    router.delete('/sessions', signOut);
+    fastify.put('/login', loginHandler);
+    app.all('/healthz', health);
+  `;
+  const calls = parseHttpRouteCalls(source);
+  assert.deepEqual(calls, [
+    { method: "GET", rawPath: "/users" },
+    { method: "POST", rawPath: "/orders/:id" },
+    { method: "DELETE", rawPath: "/sessions" },
+    { method: "PUT", rawPath: "/login" },
+    { method: "GET", rawPath: "/healthz" },
+  ]);
+});
+
+test("discoverBackendJourneys deduplicates by method+path across multiple server files", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-be-"));
+  await fs.mkdir(path.join(dir, "routes"), { recursive: true });
+  await fs.writeFile(
+    path.join(dir, "server.js"),
+    "app.get('/health', (req,res)=>res.send('ok'));",
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(dir, "routes/orders.js"),
+    "router.post('/orders', create); router.get('/orders/:id', read);",
+    "utf8"
+  );
+  const files = ["server.js", "routes/orders.js"];
+  const endpoints = discoverBackendJourneys(files, dir);
+  assert.equal(endpoints.length, 3);
+  const keys = endpoints.map((e) => `${e.method} ${e.path}`).sort();
+  assert.deepEqual(keys, ["GET /health", "GET /orders/1", "POST /orders"]);
+});
+
+test("buildFixtureExample emits a .example with routeParams + auth when journeys signal them", () => {
+  const journeys = [
+    { path: "/login", params: [] },
+    { path: "/motor-insurance/main/motor-basic-form", params: ["lang", "insuranceType", "channel"] },
+    { path: "/upload-documents", params: [] },
+  ];
+  const stack = { hasFrontend: true };
+  const asset = buildFixtureExample({ journeys, stack, scan: {} });
+  assert.ok(asset);
+  assert.equal(asset.path, "tests/fixtures/qa-uat.local.json.example");
+  const parsed = JSON.parse(asset.contents);
+  assert.ok(parsed.auth, "auth slot present when /login route exists");
+  assert.ok(parsed.upload, "upload slot present when /upload-documents route exists");
+  assert.deepEqual(Object.keys(parsed.routeParams).sort(), ["channel", "insuranceType", "lang"]);
+});
+
+test("buildFixtureExample returns null when no signals are present", () => {
+  const journeys = [{ path: "/", params: [] }, { path: "/about", params: [] }];
+  const asset = buildFixtureExample({ journeys, stack: { hasFrontend: true }, scan: {} });
+  assert.equal(asset, null);
+});
+
+import {
+  fromSvelteKit,
+  fromRemix,
+  fromAstro,
+  discoverFileBasedRoute,
+  extractFormFields,
+  extractApiCalls,
+  annotateJourneysWithForms,
+  annotateJourneysWithApiCalls,
+  aggregateApiCallsFromJourneys,
+  clusterJourneys,
+  buildWalkerAssets,
+} from "../src/index.js";
+
+test("SvelteKit file-routing handles +page.svelte, [slug], (groups), [[optional]]", () => {
+  assert.equal(fromSvelteKit("src/routes/+page.svelte"), "/");
+  assert.equal(fromSvelteKit("src/routes/about/+page.svelte"), "/about");
+  assert.equal(fromSvelteKit("src/routes/blog/[slug]/+page.svelte"), "/blog/:slug");
+  assert.equal(fromSvelteKit("src/routes/(marketing)/page/+page.svelte"), "/page");
+  assert.equal(fromSvelteKit("src/routes/posts/[[lang]]/+page.svelte"), "/posts/:lang?");
+  assert.equal(fromSvelteKit("src/routes/blog/+layout.svelte"), null);
+});
+
+test("Remix file-routing handles _index, $param, dot-separators", () => {
+  assert.equal(fromRemix("app/routes/_index.tsx"), "/");
+  assert.equal(fromRemix("app/routes/about.tsx"), "/about");
+  assert.equal(fromRemix("app/routes/blog.$slug.tsx"), "/blog/:slug");
+  assert.equal(fromRemix("app/routes/blog._index.tsx"), "/blog");
+});
+
+test("Astro file-routing handles index, [slug], [...rest]", () => {
+  assert.equal(fromAstro("src/pages/index.astro"), "/");
+  assert.equal(fromAstro("src/pages/about.astro"), "/about");
+  assert.equal(fromAstro("src/pages/blog/[slug].astro"), "/blog/:slug");
+  assert.equal(fromAstro("src/pages/docs/[...path].astro"), "/docs/:path");
+});
+
+test("discoverFileBasedRoute returns the first hit across the three frameworks", () => {
+  assert.equal(discoverFileBasedRoute("src/routes/about/+page.svelte"), "/about");
+  assert.equal(discoverFileBasedRoute("app/routes/blog.$slug.tsx"), "/blog/:slug");
+  assert.equal(discoverFileBasedRoute("src/pages/blog/[slug].astro"), "/blog/:slug");
+  assert.equal(discoverFileBasedRoute("random.txt"), null);
+});
+
+test("extractFormFields finds MUI TextField + HTML input + RHF register", () => {
+  const source = `
+    function Form() {
+      const { register } = useForm();
+      return (
+        <form>
+          <TextField label="First Name" required />
+          <Select label="Country" name="country" />
+          <input type="email" name="email" required placeholder="you@example.com" />
+          <textarea name="bio" />
+          <button {...register("password", { required: true, minLength: 8 })} />
+        </form>
+      );
+    }
+  `;
+  const fields = extractFormFields(source);
+  const summary = fields.map((f) => ({ kind: f.kind, name: f.name, label: f.label, required: !!f.required }));
+  assert.deepEqual(
+    summary,
+    [
+      { kind: "textfield", name: undefined, label: "First Name", required: true },
+      { kind: "select", name: "country", label: "Country", required: false },
+      { kind: "input", name: "email", label: "you@example.com", required: true },
+      { kind: "textarea", name: "bio", label: undefined, required: false },
+      { kind: "rhf-register", name: "password", label: undefined, required: true },
+    ]
+  );
+  const passwordField = fields.find((f) => f.name === "password");
+  assert.equal(passwordField.validation.required, "true");
+  assert.equal(passwordField.validation.minLength, "8");
+});
+
+test("extractApiCalls catches axios + fetch + helper-style calls", () => {
+  const source = `
+    await axios.get('/api/users');
+    await axios.post("/api/orders", payload);
+    await axios.get("https://api.vendor.com/external");
+    await fetch('/api/health');
+    await fetch("//cdn.vendor.com/asset.json");
+    await fetch("/api/login", { method: "POST", body });
+    await apiClient.delete('/api/sessions');
+  `;
+  const calls = extractApiCalls(source);
+  const keys = calls.map((c) => `${c.method} ${c.path}`).sort();
+  assert.deepEqual(keys, [
+    "DELETE /api/sessions",
+    "GET /api/health",
+    "GET /api/users",
+    "POST /api/login",
+    "POST /api/orders",
+  ]);
+});
+
+test("annotateJourneysWithForms attaches forms to journeys from real source files", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-ff-"));
+  await fs.mkdir(path.join(dir, "src/Pages/Login"), { recursive: true });
+  await fs.writeFile(
+    path.join(dir, "src/Pages/Login/Login.jsx"),
+    `export default function Login() {
+       return (<form>
+         <TextField label="Email" name="email" required />
+         <input type="password" name="password" required />
+       </form>);
+     }`,
+    "utf8"
+  );
+  const journeys = [
+    { path: "/login", source: "src/Pages/Login/Login.jsx", dynamic: false },
+  ];
+  annotateJourneysWithForms(journeys, dir);
+  assert.equal(journeys[0].forms?.length, 2);
+  assert.equal(journeys[0].forms[0].label, "Email");
+});
+
+test("annotateJourneysWithApiCalls + aggregateApiCallsFromJourneys roll calls up", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-api-"));
+  await fs.mkdir(path.join(dir, "src/Pages/Login"), { recursive: true });
+  await fs.writeFile(
+    path.join(dir, "src/Pages/Login/Login.jsx"),
+    `export default function Login() { axios.post('/api/sessions', {}); }`,
+    "utf8"
+  );
+  const journeys = [{ path: "/login", source: "src/Pages/Login/Login.jsx" }];
+  annotateJourneysWithApiCalls(journeys, dir);
+  assert.deepEqual(journeys[0].apiCalls, [{ method: "POST", path: "/api/sessions" }]);
+  const aggregated = aggregateApiCallsFromJourneys(journeys);
+  assert.equal(aggregated.length, 1);
+  assert.equal(aggregated[0].framework, "frontend-call");
+});
+
+test("clusterJourneys groups motor flow + orders stages by funnel keywords", () => {
+  const journeys = [
+    { path: "/motor-insurance/main/motor-basic-form" },
+    { path: "/motor-insurance/main/motor-vehicle-info" },
+    { path: "/motor-insurance/main/motor-best-deals" },
+    { path: "/motor-insurance/main/proposer-info" },
+    { path: "/motor-insurance/main/upload-documents" },
+    { path: "/motor-insurance/main/motor-summary" },
+    { path: "/motor-insurance/main/motor-payment" },
+    { path: "/about" },
+  ];
+  const clusters = clusterJourneys(journeys);
+  const motor = clusters.find((c) => c.name.startsWith("motor-insurance"));
+  assert.ok(motor, "expected a motor cluster");
+  assert.deepEqual(
+    motor.stages.map((s) => s.tag),
+    ["entry", "info", "options", "details", "docs", "summary", "payment"]
+  );
+});
+
+test("buildWalkerAssets emits a walker spec for funnel-shaped clusters", () => {
+  const journeys = [
+    { path: "/motor-insurance/main/motor-basic-form", source: "X.jsx" },
+    { path: "/motor-insurance/main/motor-vehicle-info", source: "X.jsx" },
+    { path: "/motor-insurance/main/motor-best-deals", source: "X.jsx" },
+    { path: "/motor-insurance/main/motor-summary", source: "X.jsx" },
+  ];
+  const assets = buildWalkerAssets(journeys);
+  assert.equal(assets.length, 1);
+  assert.match(assets[0].path, /walker\.ts$/);
+  assert.match(assets[0].content, /export const STAGES/);
+  assert.match(assets[0].content, /export async function walkTo/);
 });

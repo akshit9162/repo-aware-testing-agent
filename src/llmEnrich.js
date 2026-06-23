@@ -109,13 +109,30 @@ ${truncated}${tail}
 
 This is the *rendered* HTML the browser saw, not source code. Identify the stable, visible elements a basic smoke test should assert. Headings, links, and buttons will appear as real DOM elements with their final text.`;
   }
+  const formsContext = Array.isArray(journey.forms) && journey.forms.length
+    ? "\n\nDetected form fields (from static analysis):\n" +
+      journey.forms.slice(0, 12).map((f) => {
+        const parts = [f.kind || "field"];
+        if (f.label) parts.push(`label="${f.label}"`);
+        if (f.name) parts.push(`name="${f.name}"`);
+        if (f.type) parts.push(`type=${f.type}`);
+        if (f.required) parts.push("required");
+        if (f.validation) parts.push(`validation=${JSON.stringify(f.validation)}`);
+        return `- ${parts.join(" ")}`;
+      }).join("\n") +
+      "\n\nUse these to suggest assertions about the form: label visibility, required-field validation messages, etc."
+    : "";
+  const apiContext = Array.isArray(journey.apiCalls) && journey.apiCalls.length
+    ? "\n\nDetected outbound API calls from this page:\n" +
+      journey.apiCalls.slice(0, 8).map((c) => `- ${c.method} ${c.path}`).join("\n")
+    : "";
   return `Route: ${journey.path}
 Content type: component source code
 Source file: ${journey.source}
 
 \`\`\`
 ${truncated}${tail}
-\`\`\`
+\`\`\`${formsContext}${apiContext}
 
 Identify the stable, visible elements that a basic smoke test should assert.`;
 }
