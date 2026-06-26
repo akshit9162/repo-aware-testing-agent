@@ -13,6 +13,10 @@ export { fromSvelteKit, fromRemix, fromAstro, discoverFileBasedRoute } from "./j
 export { extractFormFields, fieldsForJourney, annotateJourneysWithForms } from "./formFieldDiscovery.js";
 export { extractApiCalls, callsForJourney, annotateJourneysWithApiCalls, aggregateApiCallsFromJourneys } from "./apiCallDiscovery.js";
 export { clusterJourneys, buildWalkerSpec, buildWalkerAssets } from "./journeyClustering.js";
+export { walkJourney, chooseCta, matchFieldsToFixture, isOtpGate, isCaptcha, buildSpecFromTrace, writeTrace } from "./walker.js";
+export { parseStoriesFile, normalizeStoryRow, normalizeApiRow, storySlug, shouldSkipStory } from "./storiesImport.js";
+export { generateStoryTests } from "./storiesToTests.js";
+export { apiToPostmanItem, apisToPostmanCollection } from "./storiesToPostman.js";
 export { discoverUnitTestTargets } from "./unitDiscovery.js";
 export { discoverApiEndpoints, cleanSource, parseExports, loadFixtures } from "./apiDiscovery.js";
 export { createSonarProperties } from "./sonarDiscovery.js";

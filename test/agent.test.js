@@ -1953,3 +1953,454 @@ test("buildWalkerAssets emits a walker spec for funnel-shaped clusters", () => {
   assert.match(assets[0].content, /export const STAGES/);
   assert.match(assets[0].content, /export async function walkTo/);
 });
+
+import {
+  chooseCta,
+  matchFieldsToFixture,
+  isOtpGate,
+  isCaptcha,
+  buildSpecFromTrace,
+  walkJourney,
+} from "../src/index.js";
+
+test("chooseCta ranks PROCEED above Cancel and respects priority order", () => {
+  const buttons = [
+    { label: "Cancel" },
+    { label: "Back" },
+    { label: "Continue" },
+    { label: "PROCEED" },
+    { label: "Submit" },
+  ];
+  assert.equal(chooseCta(buttons).label, "PROCEED");
+  // After we strip PROCEED, Continue wins (it's earlier in priority list than Submit)
+  const without = buttons.filter((b) => b.label !== "PROCEED");
+  assert.equal(chooseCta(without).label, "Continue");
+  // No priority match → first visible non-cancel button
+  const onlyMisc = [{ label: "Cancel" }, { label: "Login" }];
+  assert.equal(chooseCta(onlyMisc).label, "Login");
+});
+
+test("chooseCta returns null when nothing usable is present", () => {
+  assert.equal(chooseCta([{ label: "Back" }, { label: "Cancel" }]), null);
+  assert.equal(chooseCta([]), null);
+});
+
+test("matchFieldsToFixture matches by label, name, placeholder, and aria-label (case-insensitive)", () => {
+  const fixture = {
+    formFills: {
+      "First Name": "TESTQA",
+      mobile_number: "95888238",
+      "customer mail id": "qa@example.com",
+    },
+  };
+  const fields = [
+    { label: "First Name" },
+    { name: "mobile_number" },
+    { placeholder: "Customer Mail ID" },
+    { label: "Unrelated" },
+  ];
+  const matches = matchFieldsToFixture(fields, fixture);
+  assert.deepEqual(
+    matches.map((m) => ({ field: m.field.label || m.field.name || m.field.placeholder, value: m.value })),
+    [
+      { field: "First Name", value: "TESTQA" },
+      { field: "mobile_number", value: "95888238" },
+      { field: "Customer Mail ID", value: "qa@example.com" },
+    ]
+  );
+});
+
+test("isOtpGate recognizes an OTP input + VALIDATE button combo", () => {
+  assert.equal(
+    isOtpGate({
+      fields: [{ label: "Enter OTP", name: "otp" }],
+      buttons: [{ label: "VALIDATE" }],
+    }),
+    true
+  );
+  assert.equal(
+    isOtpGate({
+      fields: [{ label: "Mobile Number" }],
+      buttons: [{ label: "PROCEED" }],
+    }),
+    false
+  );
+});
+
+test("isCaptcha recognizes common challenge text", () => {
+  assert.equal(isCaptcha({ text: "I'm not a robot — reCAPTCHA" }), true);
+  assert.equal(isCaptcha({ text: "Verify you are human" }), true);
+  assert.equal(isCaptcha({ text: "Welcome back" }), false);
+});
+
+test("buildSpecFromTrace emits a deterministic Playwright spec from a recorded trace", () => {
+  const trace = {
+    entryUrl: "https://uat.example.com/start",
+    startedAt: "2026-06-25T10:00:00.000Z",
+    terminalUrl: "https://uat.example.com/done",
+    terminationReason: "matched stopWhen",
+    stages: [
+      {
+        url: "https://uat.example.com/start",
+        filledFields: [{ label: "First Name", value: "TESTQA" }],
+        ctaClicked: { label: "PROCEED" },
+        transition: { toUrl: "https://uat.example.com/step-2", urlChanged: true },
+      },
+      {
+        url: "https://uat.example.com/step-2",
+        ctaClicked: { label: "Submit" },
+        transition: { toUrl: "https://uat.example.com/done", urlChanged: true },
+      },
+    ],
+  };
+  const spec = buildSpecFromTrace(trace, { specName: "uat-example" });
+  assert.match(spec, /test\('walked journey: uat-example'/);
+  assert.match(spec, /page\.goto\("https:\/\/uat\.example\.com\/start"/);
+  assert.match(spec, /getByLabel\("First Name"\)\.fill\("TESTQA"\)/);
+  assert.match(spec, /getByRole\('button', \{ name: "PROCEED" \}\)\.first\(\)\.click\(\)/);
+  assert.match(spec, /getByRole\('button', \{ name: "Submit" \}\)\.first\(\)\.click\(\)/);
+});
+
+test("walkJourney drives a fake page through a 2-stage flow until the terminal URL", async () => {
+  // Mock Playwright page: 3 states, each with its own snapshot + URL.
+  // The walker fills, clicks CTA, and we advance to the next state.
+  const states = [
+    {
+      url: "https://uat.example.com/start",
+      snapshot: {
+        fields: [{ label: "First Name", name: "firstName", type: "text", disabled: false }],
+        buttons: [{ label: "PROCEED" }, { label: "Back" }],
+        text: "",
+      },
+    },
+    {
+      url: "https://uat.example.com/step-2",
+      snapshot: {
+        fields: [{ label: "Mobile Number", name: "mobile", type: "tel", disabled: false }],
+        buttons: [{ label: "Submit" }],
+        text: "",
+      },
+    },
+    {
+      url: "https://uat.example.com/done",
+      snapshot: {
+        fields: [],
+        buttons: [],
+        text: "Order complete",
+      },
+    },
+  ];
+
+  let pointer = 0;
+  const fills = [];
+  const clicks = [];
+
+  const fakePage = {
+    url: () => states[pointer].url,
+    title: async () => `state-${pointer}`,
+    waitForTimeout: async () => {},
+    goto: async (url) => {
+      const idx = states.findIndex((s) => s.url === url);
+      if (idx >= 0) pointer = idx;
+    },
+    evaluate: async () => states[pointer].snapshot,
+    getByLabel: () => ({ first: () => ({ fill: async (v) => { fills.push({ pointer, value: v }); } }) }),
+    locator: () => ({ first: () => ({ fill: async () => {} }) }),
+    getByRole: (_role, { name }) => ({
+      first: () => ({
+        click: async () => {
+          clicks.push({ pointer, label: name });
+          if (pointer < states.length - 1) pointer += 1;
+        },
+      }),
+    }),
+    getByText: () => ({ first: () => ({ click: async () => {} }) }),
+  };
+
+  const trace = await walkJourney({
+    entryUrl: "https://uat.example.com/start",
+    fixture: { formFills: { "First Name": "TESTQA", mobile: "95888238" } },
+    maxSteps: 5,
+    stopWhen: /\/done$/,
+    page: fakePage,
+  });
+
+  assert.equal(trace.terminationReason, "matched stopWhen");
+  assert.equal(trace.terminalUrl, "https://uat.example.com/done");
+  assert.equal(trace.stages.length, 3); // start + step-2 + done (terminal)
+  assert.deepEqual(trace.stages[0].filledFields, [{ label: "First Name", name: "firstName", value: "TESTQA" }]);
+  assert.equal(trace.stages[0].ctaClicked.label, "PROCEED");
+  assert.equal(trace.stages[1].ctaClicked.label, "Submit");
+  assert.equal(clicks.length, 2);
+});
+
+test("walkJourney halts on OTP when fixture provides no bypass", async () => {
+  const fakePage = {
+    url: () => "https://uat.example.com/otp",
+    title: async () => "OTP",
+    waitForTimeout: async () => {},
+    goto: async () => {},
+    evaluate: async () => ({
+      fields: [{ label: "Enter OTP", name: "otp", type: "text" }],
+      buttons: [{ label: "VALIDATE" }],
+      text: "",
+    }),
+    getByLabel: () => ({ first: () => ({ fill: async () => {} }) }),
+    locator: () => ({ first: () => ({ fill: async () => {} }) }),
+    getByRole: () => ({ first: () => ({ click: async () => {} }) }),
+    getByText: () => ({ first: () => ({ click: async () => {} }) }),
+  };
+  const trace = await walkJourney({
+    entryUrl: "https://uat.example.com/otp",
+    fixture: {},
+    page: fakePage,
+  });
+  assert.equal(trace.terminationReason, "OTP required");
+  assert.equal(trace.stages[0].terminated, "OTP required, no fixture.auth.otpBypass");
+});
+
+import {
+  parseStoriesFile,
+  normalizeStoryRow,
+  normalizeApiRow,
+  storySlug,
+  shouldSkipStory,
+  generateStoryTests,
+  apiToPostmanItem,
+  apisToPostmanCollection,
+} from "../src/index.js";
+import * as XLSX from "xlsx";
+
+function writeFixtureWorkbook(filePath, { stories, apis } = {}) {
+  const wb = XLSX.utils.book_new();
+  if (stories) {
+    const ws = XLSX.utils.json_to_sheet(stories);
+    XLSX.utils.book_append_sheet(wb, ws, "User Stories");
+  }
+  if (apis) {
+    const ws = XLSX.utils.json_to_sheet(apis);
+    XLSX.utils.book_append_sheet(wb, ws, "APIs");
+  }
+  XLSX.writeFile(wb, filePath);
+}
+
+test("normalizeStoryRow maps common Jira/Linear/Notion-style columns", () => {
+  const raw = {
+    "Story ID": "US-101",
+    "Summary": "Register with email",
+    "As a": "customer",
+    "I want": "to register with my email",
+    "So that": "I can access the dashboard",
+    "Acceptance Criteria": "Dashboard shows welcome message",
+    "Priority": "High",
+    "Status": "Backlog",
+    "Labels": "auth, onboarding",
+  };
+  const norm = normalizeStoryRow(raw);
+  assert.equal(norm.id, "US-101");
+  assert.equal(norm.title, "Register with email");
+  assert.equal(norm.asA, "customer");
+  assert.equal(norm.want, "to register with my email");
+  assert.equal(norm.benefit, "I can access the dashboard");
+  assert.equal(norm.ac, "Dashboard shows welcome message");
+  assert.equal(norm.priority, "High");
+  assert.equal(norm.status, "Backlog");
+  assert.equal(norm.tags, "auth, onboarding");
+});
+
+test("normalizeApiRow uppercases verbs and ensures leading slash on paths", () => {
+  const raw = {
+    "Method": "post",
+    "URL": "users/register",
+    "Description": "Create a new user",
+    "Request Body": '{"email":"x"}',
+    "Expected Status": "201",
+  };
+  const norm = normalizeApiRow(raw);
+  assert.equal(norm.method, "POST");
+  assert.equal(norm.path, "/users/register");
+  assert.equal(norm.statusCode, "201");
+});
+
+test("shouldSkipStory drops Done/Closed/Cancelled rows", () => {
+  assert.equal(shouldSkipStory({ status: "Done" }), true);
+  assert.equal(shouldSkipStory({ status: "Closed" }), true);
+  assert.equal(shouldSkipStory({ status: "Won't Do" }), true);
+  assert.equal(shouldSkipStory({ status: "In Progress" }), false);
+  assert.equal(shouldSkipStory({ status: "" }), false);
+});
+
+test("parseStoriesFile reads .xlsx with auto-detected sheets", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-stories-"));
+  const xlsx = path.join(dir, "stories.xlsx");
+  writeFixtureWorkbook(xlsx, {
+    stories: [
+      {
+        "Story ID": "US-001",
+        "Summary": "Login with email",
+        "As a": "user",
+        "I want": "log in",
+        "So that": "see dashboard",
+        "Acceptance Criteria": "valid creds → dashboard",
+        "Status": "Backlog",
+      },
+      {
+        "Story ID": "US-002",
+        "Summary": "Logout",
+        "As a": "user",
+        "I want": "log out",
+        "So that": "end session",
+        "Acceptance Criteria": "logout button clears session",
+        "Status": "Done",
+      },
+    ],
+    apis: [
+      { "Method": "post", "URL": "/auth/login", "Description": "Login", "Expected Status": "200" },
+      { "Method": "post", "URL": "/auth/logout", "Description": "Logout", "Expected Status": "204" },
+    ],
+  });
+  const parsed = parseStoriesFile(xlsx);
+  assert.equal(parsed.stories.length, 2);
+  assert.equal(parsed.stories[0].id, "US-001");
+  assert.equal(parsed.apis.length, 2);
+  assert.equal(parsed.apis[0].method, "POST");
+  assert.equal(parsed.sheets.stories, "User Stories");
+  assert.equal(parsed.sheets.apis, "APIs");
+});
+
+test("parseStoriesFile reads CSV as a single stories sheet", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-stories-csv-"));
+  const csv = path.join(dir, "stories.csv");
+  await fs.writeFile(
+    csv,
+    "ID,Title,Acceptance Criteria\nUS-1,Reset password,User can reset via email link\n",
+    "utf8"
+  );
+  const parsed = parseStoriesFile(csv);
+  assert.equal(parsed.stories.length, 1);
+  assert.equal(parsed.stories[0].title, "Reset password");
+});
+
+test("parseStoriesFile reads .json with stories + apis", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-stories-json-"));
+  const jsonPath = path.join(dir, "stories.json");
+  await fs.writeFile(
+    jsonPath,
+    JSON.stringify({
+      stories: [{ "Story ID": "X-1", "Title": "Search products" }],
+      apis: [{ "Method": "GET", "Path": "/products/search" }],
+    }),
+    "utf8"
+  );
+  const parsed = parseStoriesFile(jsonPath);
+  assert.equal(parsed.stories.length, 1);
+  assert.equal(parsed.stories[0].id, "X-1");
+  assert.equal(parsed.apis.length, 1);
+  assert.equal(parsed.apis[0].path, "/products/search");
+});
+
+test("storySlug prefers ID, falls back to title, then story-index", () => {
+  assert.equal(storySlug({ id: "US-101", title: "Anything" }), "us-101");
+  assert.equal(storySlug({ title: "Register With Email" }), "register-with-email");
+  assert.equal(storySlug({}, 3), "story-4");
+});
+
+test("generateStoryTests emits skeleton TODO blocks when no LLM client is available", async () => {
+  const stories = [
+    {
+      id: "US-101",
+      title: "Register with email",
+      asA: "customer",
+      want: "to register with my email",
+      benefit: "I can access the dashboard",
+      ac: "After registering, I see the dashboard.",
+    },
+    {
+      id: "US-102",
+      title: "Logout",
+      status: "Done", // should be skipped
+    },
+  ];
+  const { specSource, stats } = await generateStoryTests({
+    stories,
+    journeys: [{ path: "/register", source: "src/Pages/Register/Register.jsx" }],
+  });
+  assert.equal(stats.total, 1);
+  assert.equal(stats.skipped, 1);
+  assert.equal(stats.skeleton, 1);
+  assert.equal(stats.enriched, 0);
+  assert.match(specSource, /US-101 — Register with email/);
+  assert.match(specSource, /TODO: implement the test/);
+  assert.match(specSource, /\/register \(src\/Pages\/Register/);
+});
+
+test("generateStoryTests uses the injected LLM client and emits concrete steps", async () => {
+  const stories = [
+    {
+      id: "US-100",
+      title: "Add item to cart",
+      ac: "Item appears in cart sidebar after click.",
+    },
+  ];
+  const fakePlan = {
+    testName: "user adds item to cart",
+    steps: [
+      { kind: "goto", path: "/products/sample" },
+      { kind: "click", name: "Add to cart" },
+      { kind: "expectText", text: "Item added" },
+    ],
+  };
+  const fakeClient = {
+    messages: {
+      create: async () => ({
+        content: [{ type: "text", text: JSON.stringify(fakePlan) }],
+      }),
+    },
+  };
+  const { specSource, stats } = await generateStoryTests({
+    stories,
+    journeys: [{ path: "/products/sample", source: "src/Pages/Product.jsx" }],
+    client: fakeClient,
+  });
+  assert.equal(stats.enriched, 1);
+  assert.equal(stats.skeleton, 0);
+  assert.match(specSource, /user adds item to cart/);
+  assert.match(specSource, /urlFor\("\/products\/sample"\)/);
+  assert.match(specSource, /getByRole\('button', \{ name: "Add to cart" \}/);
+  assert.match(specSource, /Item added/);
+});
+
+test("apiToPostmanItem generates a request with auth header + JSON body + assertions", () => {
+  const item = apiToPostmanItem({
+    method: "POST",
+    path: "/orders",
+    description: "Create order",
+    auth: "true",
+    request: JSON.stringify({ itemId: 1 }),
+    response: JSON.stringify({ orderId: 1, status: "PENDING" }),
+    statusCode: "201",
+    contentType: "application/json",
+  });
+  assert.equal(item.request.method, "POST");
+  assert.equal(item.request.url.host[0], "{{apiHost}}");
+  assert.deepEqual(item.request.url.path, ["orders"]);
+  assert.ok(item.request.header.some((h) => h.key === "Authorization"));
+  assert.ok(item.request.header.some((h) => h.key === "Content-Type"));
+  const script = item.event[0].script.exec.join("\n");
+  assert.match(script, /status 201/);
+  assert.match(script, /returns JSON/);
+  assert.match(script, /response has orderId/);
+});
+
+test("apisToPostmanCollection wraps items with apiHost + authToken variables", () => {
+  const coll = apisToPostmanCollection([
+    { method: "GET", path: "/health" },
+    { method: "DELETE", path: "/sessions" },
+  ]);
+  assert.equal(coll.item.length, 2);
+  assert.equal(coll.variable[0].key, "apiHost");
+  assert.equal(coll.variable[1].key, "authToken");
+  // DELETE inherits default 204 status when none specified
+  const deleteScript = coll.item[1].event[0].script.exec.join("\n");
+  assert.match(deleteScript, /status 204/);
+});

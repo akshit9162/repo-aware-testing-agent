@@ -1,0 +1,340 @@
+/**
+ * Generate Playwright specs from imported user stories.
+ *
+ * Two modes:
+ *   - **Skeleton mode** (no API key): emit one `describe` block per story
+ *     with the story metadata + acceptance criteria as comments and TODO
+ *     stubs. Cheap, deterministic, run anywhere.
+ *   - **LLM-enriched mode** (API key set): for each story, ask the model
+ *     to return concrete Playwright steps grounded in the agent's already-
+ *     discovered routes and form fields. Cached per story+route fingerprint
+ *     under .qa-agent-cache/llm-stories/.
+ *
+ * Discovery context is reused as-is — we feed the LLM the SAME journeys +
+ * forms that `enrichJourneys` already builds.
+ */
+import { storySlug, shouldSkipStory } from "./storiesImport.js";
+import crypto from "node:crypto";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+
+const CACHE_DIR = ".qa-agent-cache/llm-stories";
+
+const STORY_LLM_PROMPT = `You are a QA test designer. Given a user story and the discovered routes / form fields of the application under test, return a Playwright test plan as JSON.
+
+Rules:
+- Return at most 8 steps per story; fewer is better than wrong.
+- Each step is an object with one of these shapes:
+  - { "kind": "goto", "path": "/route-path" }
+  - { "kind": "fill", "label": "Field Name", "value": "..." }
+  - { "kind": "click", "name": "Button or Link Label" }
+  - { "kind": "select", "label": "Field Name", "option": "..." }
+  - { "kind": "check", "label": "Checkbox Label" }
+  - { "kind": "expectUrl", "pattern": "/dashboard" }
+  - { "kind": "expectText", "text": "Welcome" }
+  - { "kind": "expectVisible", "role": "heading" | "button" | "link", "name": "..." }
+- Use ONLY routes and field labels that appear in the provided discovery context. If something is missing, omit that step rather than guess.
+- Pick the route(s) most relevant to the story; if none match closely, pick one and add an expectText step matching a quote from the acceptance criteria.
+- Test name should be a short imperative sentence summarizing the story.`;
+
+const STORY_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["testName", "steps"],
+  properties: {
+    testName: { type: "string" },
+    steps: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          kind: { enum: ["goto", "fill", "click", "select", "check", "expectUrl", "expectText", "expectVisible"] },
+          path: { type: "string" },
+          label: { type: "string" },
+          value: { type: "string" },
+          name: { type: "string" },
+          option: { type: "string" },
+          pattern: { type: "string" },
+          text: { type: "string" },
+          role: { type: "string" },
+        },
+        required: ["kind"],
+      },
+    },
+  },
+};
+
+function escapeStr(s) {
+  return JSON.stringify(String(s ?? ""));
+}
+
+function relevantJourneys(story, journeys, limit = 8) {
+  if (!journeys?.length) return [];
+  const text = `${story.title || ""} ${story.description || ""} ${story.ac || ""} ${story.tags || ""}`.toLowerCase();
+  const storyWords = new Set(text.split(/[^\w]+/).filter((w) => w.length >= 3));
+  if (!storyWords.size) return [];
+  return journeys
+    .map((j) => {
+      const haystack = `${j.path || ""} ${j.title || ""} ${(j.forms || []).map((f) => f.label || f.name || "").join(" ")}`.toLowerCase();
+      const words = haystack.split(/[^\w]+/).filter((w) => w.length >= 3);
+      const score = words.reduce((acc, w) => (storyWords.has(w) ? acc + 1 : acc), 0);
+      return { journey: j, score };
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((entry) => entry.journey);
+}
+
+function buildSkeletonBlock(story, idx, related) {
+  const slug = storySlug(story, idx);
+  const title = story.title || `Story ${idx + 1}`;
+  const acLines = (story.ac || "")
+    .split(/\r?\n+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const relatedLines = related.length
+    ? "  //   " +
+      related.map((j) => `${j.path} (${j.source || "?"})`).join("\n  //   ")
+    : "  //   (no matching routes discovered in this repo)";
+  const story_summary = [
+    story.asA ? `As a ${story.asA}` : null,
+    story.want ? `I want ${story.want}` : null,
+    story.benefit ? `So that ${story.benefit}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n  // ");
+  return `test.describe(${escapeStr(`${story.id ? story.id + " — " : ""}${title}`)}, () => {
+  test('happy path', async ({ page }) => {
+    // ${story_summary || "—"}
+    //
+    // Acceptance Criteria:
+${acLines.length ? acLines.map((l) => `    //   ${l}`).join("\n") : "    //   (none provided)"}
+    //
+    // Discovered routes that may be relevant:
+${relatedLines}
+
+    // TODO: implement the test for ${slug}.
+    expect(true).toBeTruthy();
+  });
+});`;
+}
+
+function buildLlmBlock(story, idx, plan) {
+  const slug = storySlug(story, idx);
+  const title = (plan?.testName || story.title || `Story ${idx + 1}`).trim();
+  const steps = (plan?.steps || []).map((step) => stepToCode(step)).filter(Boolean);
+  return `test.describe(${escapeStr(`${story.id ? story.id + " — " : ""}${story.title || slug}`)}, () => {
+  test(${escapeStr(title)}, async ({ page }) => {
+${steps.map((line) => "    " + line).join("\n") || "    // (LLM returned no steps)"}
+  });
+});`;
+}
+
+function stepToCode(step) {
+  switch (step?.kind) {
+    case "goto":
+      return `await page.goto(urlFor(${escapeStr(step.path)}), { waitUntil: 'domcontentloaded' });`;
+    case "fill":
+      return `await page.getByLabel(${escapeStr(step.label)}, { exact: false }).first().fill(${escapeStr(step.value || "")});`;
+    case "click":
+      return `await page.getByRole('button', { name: ${escapeStr(step.name)} }).first().click();`;
+    case "select":
+      return `await page.getByLabel(${escapeStr(step.label)}, { exact: false }).first().selectOption(${escapeStr(step.option || "")});`;
+    case "check":
+      return `await page.getByLabel(${escapeStr(step.label)}, { exact: false }).first().check();`;
+    case "expectUrl":
+      return `await expect(page).toHaveURL(new RegExp(${escapeStr(step.pattern || "")}));`;
+    case "expectText":
+      return `await expect(page.getByText(${escapeStr(step.text || "")}, { exact: false }).first()).toBeVisible();`;
+    case "expectVisible":
+      return `await expect(page.getByRole(${escapeStr(step.role || "button")}, { name: ${escapeStr(step.name || "")} }).first()).toBeVisible();`;
+    default:
+      return null;
+  }
+}
+
+function fingerprint(story, related) {
+  const h = crypto.createHash("sha1");
+  h.update(JSON.stringify({ story, related: related.map((j) => j.path) }));
+  return h.digest("hex");
+}
+
+async function readCached(repoRoot, key) {
+  try {
+    return JSON.parse(await fs.readFile(path.join(repoRoot, CACHE_DIR, key + ".json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function writeCached(repoRoot, key, value) {
+  try {
+    const dir = path.join(repoRoot, CACHE_DIR);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, key + ".json"), JSON.stringify(value, null, 2), "utf8");
+  } catch {}
+}
+
+async function llmPlanForStory({ client, provider, model, story, related }) {
+  const journeyContext = related.length
+    ? related.map((j) => {
+        const forms = (j.forms || []).slice(0, 8).map((f) => `${f.label || f.name || "field"}${f.required ? "*" : ""}`).join(", ");
+        return `- ${j.path}  forms: [${forms}]`;
+      }).join("\n")
+    : "(no matching routes — pick one and write an expectText assertion from the AC)";
+  const userMessage = `User story:
+- ID: ${story.id || "(none)"}
+- Title: ${story.title || "(none)"}
+- As a: ${story.asA || "(none)"}
+- I want: ${story.want || "(none)"}
+- So that: ${story.benefit || "(none)"}
+- Acceptance Criteria:
+${(story.ac || "(none)").split(/\r?\n/).map((l) => `  ${l}`).join("\n")}
+
+Discovered routes / forms (use ONLY these):
+${journeyContext}
+
+Return the test plan JSON now.`;
+
+  if (provider === "openai") {
+    const response = await client.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: STORY_LLM_PROMPT },
+        { role: "user", content: userMessage },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "story_test_plan", strict: false, schema: STORY_SCHEMA },
+      },
+    });
+    const text = response.choices?.[0]?.message?.content;
+    return text ? JSON.parse(text) : null;
+  }
+  const response = await client.messages.create({
+    model,
+    max_tokens: 1500,
+    system: STORY_LLM_PROMPT,
+    output_config: { format: { type: "json_schema", schema: STORY_SCHEMA } },
+    messages: [{ role: "user", content: userMessage }],
+  });
+  const text = response.content?.find?.((b) => b.type === "text")?.text;
+  return text ? JSON.parse(text) : null;
+}
+
+async function importClient(provider, apiKey) {
+  const sdkName = provider === "openai" ? "openai" : "@anthropic-ai/sdk";
+  const mod = await import(sdkName);
+  const Ctor = mod.default || mod;
+  return new Ctor({ apiKey });
+}
+
+function selectProvider({ injectedClient, anthropicKey, openaiKey, override }) {
+  if (override) return override.toLowerCase();
+  if (process.env.QA_LLM_PROVIDER) return process.env.QA_LLM_PROVIDER.toLowerCase();
+  if (injectedClient?.chat?.completions?.create) return "openai";
+  if (injectedClient?.messages?.create) return "anthropic";
+  if (anthropicKey || process.env.ANTHROPIC_API_KEY) return "anthropic";
+  if (openaiKey || process.env.OPENAI_API_KEY) return "openai";
+  return null;
+}
+
+/**
+ * Public API. Returns:
+ *   { specSource: string, stats: { total, skipped, enriched, skeleton, failed } }
+ */
+export async function generateStoryTests({
+  stories,
+  journeys = [],
+  repoRoot,
+  client: injectedClient,
+  provider: providerOverride,
+  model: modelOverride,
+  anthropicApiKey,
+  openaiApiKey,
+  logger = () => {},
+} = {}) {
+  if (!Array.isArray(stories) || !stories.length) {
+    return {
+      specSource: emptySpec("No stories were imported."),
+      stats: { total: 0, skipped: 0, enriched: 0, skeleton: 0, failed: 0 },
+    };
+  }
+  const usableStories = stories.filter((s) => !shouldSkipStory(s));
+  const skipped = stories.length - usableStories.length;
+
+  const provider = selectProvider({
+    injectedClient,
+    anthropicKey: anthropicApiKey,
+    openaiKey: openaiApiKey,
+    override: providerOverride,
+  });
+  const useLlm = Boolean(provider);
+  const model =
+    modelOverride ||
+    process.env.QA_LLM_MODEL ||
+    (provider === "openai" ? "gpt-4o-mini" : "claude-sonnet-4-6");
+  let client = injectedClient || null;
+  if (useLlm && !client) {
+    const key =
+      provider === "anthropic"
+        ? anthropicApiKey || process.env.ANTHROPIC_API_KEY
+        : openaiApiKey || process.env.OPENAI_API_KEY;
+    if (key) client = await importClient(provider, key);
+  }
+
+  const stats = { total: usableStories.length, skipped, enriched: 0, skeleton: 0, failed: 0 };
+  const blocks = [];
+
+  for (let idx = 0; idx < usableStories.length; idx += 1) {
+    const story = usableStories[idx];
+    const related = relevantJourneys(story, journeys);
+    let plan = null;
+    if (useLlm && client) {
+      const key = fingerprint(story, related);
+      plan = repoRoot ? await readCached(repoRoot, key) : null;
+      if (!plan) {
+        try {
+          plan = await llmPlanForStory({ client, provider, model, story, related });
+          if (plan && repoRoot) await writeCached(repoRoot, key, plan);
+        } catch (error) {
+          stats.failed += 1;
+          logger("story enrichment failed: " + (error?.message || String(error)));
+        }
+      }
+    }
+    if (plan && plan.steps?.length) {
+      blocks.push(buildLlmBlock(story, idx, plan));
+      stats.enriched += 1;
+    } else {
+      blocks.push(buildSkeletonBlock(story, idx, related));
+      stats.skeleton += 1;
+    }
+  }
+
+  return {
+    specSource: wrapSpec(blocks),
+    stats,
+  };
+}
+
+function wrapSpec(blocks) {
+  return `import { test, expect } from '@playwright/test';
+import { urlFor } from '../helpers/journey-fixture';
+
+// Generated by repo-qa-agent stories on ${new Date().toISOString()}.
+// One describe block per imported user story; LLM-enriched when an
+// ANTHROPIC_API_KEY / OPENAI_API_KEY was available at generation time.
+
+${blocks.join("\n\n")}
+`;
+}
+
+function emptySpec(reason) {
+  return `import { test } from '@playwright/test';
+// ${reason}
+test.skip('user-stories.spec.ts has no stories yet', () => {});
+`;
+}

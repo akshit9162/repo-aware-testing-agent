@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, mergeJourneys, importHar, repair, bootstrapVisual, codingFix, codingFixInWorktree, buildRepoIndex, writeRepoIndex, queryRepoIndex, buildPatchBundle, renderPrMarkdown } from "./index.js";
+import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, mergeJourneys, importHar, repair, bootstrapVisual, codingFix, codingFixInWorktree, buildRepoIndex, writeRepoIndex, queryRepoIndex, buildPatchBundle, renderPrMarkdown, walkJourney, writeTrace, buildSpecFromTrace, parseStoriesFile, generateStoryTests, apisToPostmanCollection } from "./index.js";
+import { annotateJourneysWithForms } from "./formFieldDiscovery.js";
 import { loadDotenv } from "./loadEnv.js";
 import { writePlaywrightCoverageExcel } from "./playwrightExcel.js";
 
@@ -47,8 +48,33 @@ LLM enrichment (required when the Playwright stage is enabled):
   Cache: .qa-agent-cache/llm-enrich/
 
 Subcommands:
+  stories <file.xlsx|.csv|.json> [--repo <path>] [--story-sheet <name>]
+          [--apis-sheet <name>] [--out <path>] [--postman-out <path>]
+          [--write]
+                       Import user stories (+ optional APIs sheet) from an
+                       Excel / CSV / JSON file. Cross-references discovered
+                       routes + form fields in --repo, then emits:
+                         - tests/e2e/user-stories.spec.ts (LLM-enriched
+                           when ANTHROPIC_API_KEY / OPENAI_API_KEY is set,
+                           skeleton TODO blocks otherwise)
+                         - postman/stories-collection.json from the APIs
+                           sheet (status + JSON shape assertions per row)
+                       Default is preview; --write commits both files.
   coverage-excel <playwright-json-report> --out <report.xls>
                        Convert a Playwright JSON report to an Excel-friendly workbook
+  walk <entryUrl> [--fixture <path>] [--max-steps N] [--out <path>]
+       [--repo <path>] [--cta <list>] [--stop-when <regex>]
+       [--headed] [--write-spec]
+  walk --urls url1,url2,... [...same options as above]
+                       Autonomously drive a real Playwright session through
+                       one or more UAT entry URLs. At each step the walker
+                       fills form fields from the fixture, clicks the highest-
+                       priority CTA (PROCEED/Continue/Submit/...), and records
+                       the URL transition. Writes one trace per URL to
+                       qa-results/walked-journey-<slug>.json. With --write-spec
+                       also emits tests/e2e/walked-journey-<slug>.spec.ts that
+                       reproduces the walk. Halts on OTP without bypass,
+                       captcha, no-CTA, or no-URL-change.
   crawl <baseUrl> [--depth N] [--max N] [--out <path>]
                        Breadth-first link-graph crawl from baseUrl. Prints JSON
                        to stdout (or writes to --out). Use to discover dynamic
@@ -211,6 +237,58 @@ function parseHarArgs(argv) {
     else if (arg === "--replace") { args.replace = true; }
     else if (arg === "--filter-origin") { args.filterOrigin = argv[i + 1]; i += 1; }
   }
+  return args;
+}
+
+function parseStoriesArgs(argv) {
+  const args = {
+    input: argv[1] && !argv[1].startsWith("--") ? argv[1] : null,
+    repoPath: ".",
+    storySheet: null,
+    apisSheet: null,
+    outPath: null,
+    postmanOut: null,
+    write: false,
+  };
+  for (let i = 1; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--repo") { args.repoPath = argv[i + 1]; i += 1; }
+    else if (arg === "--story-sheet") { args.storySheet = argv[i + 1]; i += 1; }
+    else if (arg === "--apis-sheet") { args.apisSheet = argv[i + 1]; i += 1; }
+    else if (arg === "--out") { args.outPath = argv[i + 1]; i += 1; }
+    else if (arg === "--postman-out") { args.postmanOut = argv[i + 1]; i += 1; }
+    else if (arg === "--write") { args.write = true; }
+  }
+  return args;
+}
+
+function parseWalkArgs(argv) {
+  const args = {
+    urls: [],
+    fixturePath: null,
+    maxSteps: 10,
+    outPath: null,
+    repoPath: ".",
+    cta: [],
+    stopWhen: null,
+    headed: false,
+    writeSpec: false,
+  };
+  // positional: walk <entryUrl> — the bare argv[1] when it doesn't start with --
+  if (argv[1] && !argv[1].startsWith("--")) args.urls.push(argv[1]);
+  for (let i = 1; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--urls") { args.urls.push(...String(argv[i + 1] || "").split(",").map((s) => s.trim()).filter(Boolean)); i += 1; }
+    else if (arg === "--fixture") { args.fixturePath = argv[i + 1]; i += 1; }
+    else if (arg === "--max-steps") { args.maxSteps = Number(argv[i + 1]); i += 1; }
+    else if (arg === "--out") { args.outPath = argv[i + 1]; i += 1; }
+    else if (arg === "--repo") { args.repoPath = argv[i + 1]; i += 1; }
+    else if (arg === "--cta") { args.cta = String(argv[i + 1] || "").split(",").map((s) => s.trim()).filter(Boolean); i += 1; }
+    else if (arg === "--stop-when") { args.stopWhen = argv[i + 1]; i += 1; }
+    else if (arg === "--headed") { args.headed = true; }
+    else if (arg === "--write-spec") { args.writeSpec = true; }
+  }
+  args.urls = Array.from(new Set(args.urls));
   return args;
 }
 
@@ -392,6 +470,122 @@ async function main() {
       filterOrigin: harArgs.filterOrigin,
     });
     console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (argv[0] === "stories") {
+    const storyArgs = parseStoriesArgs(argv);
+    if (!storyArgs.input) {
+      throw new Error("Usage: repo-qa-agent stories <file.xlsx|.csv|.json> [--repo <path>] [--story-sheet <name>] [--apis-sheet <name>] [--out <path>] [--postman-out <path>] [--write]");
+    }
+    const repoRoot = path.resolve(storyArgs.repoPath);
+    if (repoRoot !== path.resolve(process.cwd())) await loadDotenv(repoRoot);
+
+    const parsed = parseStoriesFile(path.resolve(storyArgs.input), {
+      storySheet: storyArgs.storySheet,
+      apisSheet: storyArgs.apisSheet,
+    });
+
+    // Pull repo discovery so the LLM gets real route + form context.
+    let journeys = [];
+    try {
+      const scan = await scanRepository(repoRoot);
+      journeys = discoverUserJourneys(scan.files, { repoRoot: scan.root });
+      annotateJourneysWithForms(journeys, scan.root);
+    } catch {
+      // Stories can be generated without a repo (e.g. pre-build planning).
+    }
+
+    const { specSource, stats } = await generateStoryTests({
+      stories: parsed.stories,
+      journeys,
+      repoRoot,
+      anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+      openaiApiKey: process.env.OPENAI_API_KEY,
+      logger: (msg) => process.stderr.write("[stories] " + msg + "\n"),
+    });
+
+    const specPath = storyArgs.outPath
+      ? path.resolve(repoRoot, storyArgs.outPath)
+      : path.resolve(repoRoot, "tests", "e2e", "user-stories.spec.ts");
+
+    let postman = null;
+    if (parsed.apis.length) {
+      postman = apisToPostmanCollection(parsed.apis, {
+        name: `Generated from ${path.basename(parsed.sourcePath)}`,
+      });
+    }
+    const postmanPath = storyArgs.postmanOut
+      ? path.resolve(repoRoot, storyArgs.postmanOut)
+      : path.resolve(repoRoot, "postman", "stories-collection.json");
+
+    const result = {
+      input: parsed.sourcePath,
+      sheets: parsed.sheets,
+      stories: { total: parsed.stories.length, ...stats },
+      apis: { total: parsed.apis.length, postmanItems: postman?.item?.length || 0 },
+      specFile: specPath,
+      postmanFile: postman ? postmanPath : null,
+      mode: storyArgs.write ? "write" : "preview",
+    };
+
+    if (storyArgs.write) {
+      await fs.mkdir(path.dirname(specPath), { recursive: true });
+      await fs.writeFile(specPath, specSource, "utf8");
+      if (postman) {
+        await fs.mkdir(path.dirname(postmanPath), { recursive: true });
+        await fs.writeFile(postmanPath, JSON.stringify(postman, null, 2) + "\n", "utf8");
+      }
+    } else {
+      result.preview = {
+        spec: specSource.slice(0, 800) + (specSource.length > 800 ? "\n// ... (truncated; use --write to commit)" : ""),
+      };
+    }
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (argv[0] === "walk") {
+    const walkArgs = parseWalkArgs(argv);
+    if (!walkArgs.urls.length) {
+      throw new Error("Usage: repo-qa-agent walk <entryUrl> [--urls url1,url2,...] [--fixture <path>] [--max-steps N] [--out <path>] [--repo <path>] [--cta <list>] [--stop-when <regex>] [--headed] [--write-spec]");
+    }
+    const repoRoot = path.resolve(walkArgs.repoPath);
+    let fixture = {};
+    if (walkArgs.fixturePath) {
+      try {
+        fixture = JSON.parse(await fs.readFile(path.resolve(walkArgs.fixturePath), "utf8"));
+      } catch (error) {
+        throw new Error(`failed to read fixture at ${walkArgs.fixturePath}: ${error.message}`);
+      }
+    }
+    const traces = [];
+    for (const url of walkArgs.urls) {
+      process.stderr.write(`[walk] ${url}\n`);
+      const trace = await walkJourney({
+        entryUrl: url,
+        fixture,
+        maxSteps: walkArgs.maxSteps,
+        ctaPriorities: walkArgs.cta.length ? walkArgs.cta : undefined,
+        stopWhen: walkArgs.stopWhen || undefined,
+        headless: !walkArgs.headed,
+        logger: (msg) => process.stderr.write("[walk] " + msg + "\n"),
+      });
+      const slug = url.replace(/^https?:\/\//, "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+      const tracePath = walkArgs.outPath
+        ? (walkArgs.urls.length > 1 ? path.resolve(repoRoot, walkArgs.outPath.replace(/\.json$/, "") + "-" + slug + ".json") : path.resolve(repoRoot, walkArgs.outPath))
+        : path.resolve(repoRoot, "qa-results", "walked-journey-" + slug + ".json");
+      writeTrace(trace, tracePath);
+      const summary = { url, traceFile: tracePath, steps: trace.steps, terminationReason: trace.terminationReason, terminalUrl: trace.terminalUrl };
+      if (walkArgs.writeSpec) {
+        const specPath = path.resolve(repoRoot, "tests", "e2e", "walked-journey-" + slug + ".spec.ts");
+        await fs.mkdir(path.dirname(specPath), { recursive: true });
+        await fs.writeFile(specPath, buildSpecFromTrace(trace, { specName: slug }), "utf8");
+        summary.specFile = specPath;
+      }
+      traces.push(summary);
+    }
+    console.log(JSON.stringify({ walks: traces }, null, 2));
     return;
   }
 

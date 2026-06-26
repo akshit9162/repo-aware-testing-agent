@@ -17,6 +17,24 @@ A standalone QA automation agent that scans a repository and generates a customi
 
 It inspects the target repo, builds a risk-aware test plan, then optionally writes starter configs, test files, Postman collections, k6 scripts, and `package.json` QA scripts.
 
+## What the agent discovers (no human glue)
+
+The discovery pipeline is layered. Each layer is best-effort; failures fall through silently.
+
+| Layer | Source | Frameworks |
+|-------|--------|------------|
+| File-based routing | filesystem layout | Next.js App Router (`app/**/page.tsx`), Next.js Pages Router, `src/{pages,routes}/**`, **SvelteKit** (`+page.svelte`, `[slug]`, `(group)`, `[[opt]]`), **Remix** (`_index`, `$param`, dotted nesting), **Astro** (`[slug].astro`, `[...rest].astro`) |
+| JSX route declarations | parsed from `.jsx`/`.tsx`/`.js`/`.ts` | **React Router** (`<Route path="..." element={<X/>}/>`, `<PublicRoute>`, `<PrivateRoute>`, custom wrappers). Uses a JSX-expression-balanced tokenizer so attributes containing `element={<X/>}` parse correctly. **Nested routes inherit parent paths** — `<Route path="/:lang?"><Route path="dashboard"/></Route>` becomes `/:lang?/dashboard`. Catch-all `*` routes are filtered. |
+| Config-based routing | parsed from router config files | **Vue Router** (`src/router/**` with `routes: [{ path, component }]` and inline `() => import('./X.vue')`) |
+| Backend HTTP routes | `app.get('/...')` / `router.post('/...')` | Express, Fastify, Koa, and generic helpers (`apiClient.delete('/...')`); flips `hasApi=true` and feeds Postman + k6 |
+| Frontend-observed API calls | axios / fetch / `apiClient.*` inside page components | Aggregated per journey + into the shared endpoint list |
+| Form fields | per page component | MUI (`<TextField>`, `<Select>`, `<Autocomplete>`, `<DatePicker>`, etc.), plain HTML (`<input>`, `<select>`, `<textarea>`), React Hook Form (`register('name', { required, minLength, pattern, ... })`) |
+| Funnel clustering | groups journeys by URL prefix | Tags each route with a stage (`entry → info → options → addons → details → docs → summary → payment → success/failure`) and emits `tests/helpers/<cluster>-walker.ts` with a `walkTo(stageId)` helper |
+| Live crawl (optional) | `--crawl-url <baseUrl>` | BFS over the deployed site; merges discovered routes with the static scan and uses captured HTML as the LLM enrichment input |
+| Fixture overrides | `qa-fixtures.json` in the target repo | Maps discovered routes to canonical paths |
+
+Dynamic param substitution applies known defaults (`:lang` → `en`, `:insuranceType` → `motor-insurance`, `:channel` → `main`, `:slug` → `sample`, `:id` → `1`, etc.) and collapses optional params (`:lang?`) to their canonical form. Per-route overrides flow through env vars (`QA_ROUTE_*`) or the generated `tests/fixtures/qa-uat.local.json` (see below).
+
 The product direction is captured in
 [docs/BEST_IN_MARKET_ROADMAP.md](./docs/BEST_IN_MARKET_ROADMAP.md): the goal is
 not generic code assistance, but a QA-native loop that turns reproducible
@@ -29,6 +47,39 @@ API tests are generated from detected API route files such as `pages/api/**`, `a
 Security and performance checks are also generated from the scan. The agent writes `.trivyignore` and a `qa:security` script that exports `qa-results/trivy.json`; severity gating is applied by `scripts/qa-run-all.mjs` via `--fail-on` (default `high`). For API repos, it generates a k6 script that load-tests each discovered endpoint with response-time and success-rate thresholds.
 
 Requires `trivy` on PATH (`brew install trivy` on macOS; see https://trivy.dev/ for other platforms).
+
+## Generated test infrastructure
+
+When the Playwright stage is enabled, the agent emits more than just per-route specs:
+
+### Per-route assertions
+- `tests/e2e/user-journeys.spec.ts` — one Playwright test per discovered route, each with LLM-derived assertions (heading text, primary CTAs, link/button labels, image presence). Tests `goto(urlFor(journey.path))` so they automatically pick up `QA_BASE_URL` and fixture-supplied param values.
+
+### Fixture system
+When discovered journeys signal that a real-world walk needs values the agent can't conjure (route params, auth credentials, file uploads), the agent emits:
+
+- `tests/fixtures/qa-uat.local.json.example` — a gitignored scaffold with `routeParams`, `auth`, and `upload` slots ready to fill.
+- `tests/helpers/journey-fixture.ts` — exports `FIXTURE`, `HAS_REAL_FIXTURE`, `baseUrl()`, `substituteParams()`, `urlFor()` so specs and walkers consume the fixture uniformly.
+
+The committed `.example` is safe to share; the `.local.json` variant (real values) stays gitignored.
+
+### Multi-stage walker helpers
+When a cluster has ≥3 staged members covering ≥2 distinct stage tags, the agent emits `tests/helpers/<cluster>-walker.ts` with:
+
+```ts
+export const STAGES = [ /* ordered by funnel keyword */ ] as const;
+export type StageId = (typeof STAGES)[number]["id"];
+export async function walkTo(page: Page, target: StageId): Promise<void> { /* ... */ }
+```
+
+The default walker progresses by clicking the first visible button matching `PROCEED`, `Continue`, `Submit`, `Next`, or `BUY NOW` — a sane default for SPA forms. Override per-stage behavior in `tests/helpers/walker-overrides.ts` (or copy the walker into your repo and edit directly).
+
+### Richer LLM prompts
+Form fields and outbound API calls detected per page are appended to the LLM prompt as extra context. The model can then suggest:
+
+- "Required: First Name (3–15 letters) — assert the inline validation message"
+- "After click, POST `/api/quote` fires — assert the loading state"
+- "Premium amount in `<TextField>` with name `premium` — assert it recalculates on add-on toggle"
 
 ## LLM journey enrichment (required when Playwright is enabled)
 
@@ -187,6 +238,91 @@ Add `--worktree` to run the patch and validation loop in a disposable git
 worktree so the original checkout stays untouched; use `--keep-worktree` when
 you want to inspect the patched worktree after the run.
 
+Generate Playwright specs + Postman collection from an Excel of user stories:
+
+```sh
+# Preview only — does not write into the repo
+node src/cli.js stories /path/to/stories.xlsx --repo /path/to/your/repo
+
+# Commit both the spec and the Postman collection
+ANTHROPIC_API_KEY=sk-ant-... \
+  node src/cli.js stories /path/to/stories.xlsx --repo /path/to/your/repo --write
+
+# Force a specific sheet (skip auto-detection)
+node src/cli.js stories stories.xlsx --story-sheet "Sprint 24 Backlog" --apis-sheet "REST endpoints"
+```
+
+The agent reads the file (`.xlsx` / `.xls` / `.csv` / `.tsv` / `.json`), auto-detects the user-story sheet (any of `User Stories`, `Stories`, `Backlog`, `Requirements`, `Features`, `Epics` — also matched as substrings) and the API sheet (`APIs`, `API Spec`, `Endpoints`, `REST`, `GraphQL`). Falls back to the first sheet when no name matches.
+
+**Column auto-detection** normalizes common variants:
+
+- **Stories:** `ID` / `Story ID` / `Jira ID` / `Issue ID` · `Title` / `Summary` / `Story Title` · `As a` / `Role` / `Persona` · `I want` / `Goal` · `So that` / `Benefit` · `Acceptance Criteria` / `AC` / `Definition of Done` · `Priority` · `Status` · `Tags` / `Labels` / `Epic` · `Story Points` / `Estimate`
+- **APIs:** `Method` / `HTTP Verb` · `Path` / `URL` / `Endpoint` · `Description` · `Auth` / `Authentication` · `Request` / `Sample Request` / `Body` · `Response` / `Expected` · `Expected Status` · `Content-Type`
+
+**Stories skipped automatically** when status is `Done`, `Closed`, `Completed`, `Won't Do`, `Cancelled`, `Archived`, or `Deprecated`.
+
+**Test generation has two modes:**
+
+- *Skeleton mode* (no API key): one `describe(...)` per story with the As-a / I-want / So-that summary and acceptance criteria as comments, plus discovered routes from the target repo's static scan, plus a `TODO` body. Cheap, deterministic, no LLM cost.
+- *LLM-enriched mode* (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY` set): the model returns a structured JSON test plan grounded in the story + the agent's already-discovered routes / forms. Each step compiles to a concrete Playwright call (`page.goto(urlFor(...))`, `getByLabel(...).fill(...)`, `getByRole('button', {name: ...}).click()`, URL/text/role assertions). Cached per story+route fingerprint under `.qa-agent-cache/llm-stories/`.
+
+**API collection generation** turns each API row into a Postman v2.1 item with:
+- Method + URL (relative paths use `{{apiHost}}` variable; absolute URLs preserved)
+- Auth header when the `Auth` column is truthy (`Bearer {{authToken}}`)
+- JSON body when the `Request` column parses as JSON
+- Status-code assertion (uses `Expected Status` column or defaults per method: GET→200, POST→201, DELETE→204, …)
+- JSON-shape assertion when Content-Type implies JSON; per-key existence asserts when a sample response is provided
+
+Writes to `tests/e2e/user-stories.spec.ts` and `postman/stories-collection.json` by default; override with `--out` and `--postman-out`.
+
+Walk one or more UAT URLs autonomously and record an end-to-end journey:
+
+```sh
+# Single entry URL — walker progresses until it can't
+node src/cli.js walk https://uat.example.com/checkout \
+  --fixture tests/fixtures/qa-uat.local.json \
+  --repo /path/to/your/repo \
+  --write-spec
+
+# Multiple URLs — each gets its own independent walk + trace
+node src/cli.js walk \
+  --urls https://uat.example.com/checkout,https://uat.example.com/onboarding \
+  --fixture tests/fixtures/qa-uat.local.json \
+  --max-steps 12 --headed
+
+# Stop when the walker hits a known terminal URL
+node src/cli.js walk https://uat.example.com/start \
+  --fixture x.json --stop-when "/(thank-you|success|done)$"
+```
+
+For each entry URL the agent launches a real (Playwright/Chromium) browser, navigates to the URL, then loops up to `--max-steps` (default 10) times: it snapshots the page, fills any form field whose label/name/placeholder matches a `formFills` key in the fixture, clicks the highest-priority CTA from `PROCEED → Continue → Submit → Next → BUY NOW → Confirm → Save → Pay` (configurable via `--cta`), and records the URL transition. It halts on captchas, on OTP screens when `fixture.auth.otpBypass` isn't set, when no CTA is found, when the URL stops changing, or when `--stop-when <regex>` matches.
+
+Output:
+
+- `qa-results/walked-journey-<slug>.json` per URL — full trace (entry, every stage's URL/title/snapshot/filled fields/clicked CTA/transition, plus `terminationReason` + `terminalUrl`).
+- With `--write-spec`, also `tests/e2e/walked-journey-<slug>.spec.ts` — a Playwright spec that reproduces the walk (navigate → fill → click → assert URL) so you can pin the journey as a regression test.
+
+Fixture shape (gitignored; the agent's `--write` step emits a `.example` scaffold):
+
+```json
+{
+  "uatUrl": "https://uat.example.com",
+  "routeParams": { "lang": "en", "channel": "main" },
+  "auth": { "otpBypass": "0000" },
+  "formFills": {
+    "First Name": "TESTQA",
+    "Last Name": "AUTOMATION",
+    "Customer mail ID": "qa-automation@example.com",
+    "Mobile Number": "95888238",
+    "Plate Code": "M",
+    "Plate Number": "92588"
+  },
+  "upload": { "slots": { "documentFront": "tests/fixtures/sample-document.jpg" } }
+}
+```
+
+Requires Chromium installed once per machine: `npx playwright install chromium`.
+
 Import a HAR file (Chrome DevTools → Network → save as HAR) into a Postman
 collection:
 
@@ -261,4 +397,46 @@ Generated tests are intentionally configurable through environment variables suc
 - `QA_API_BASE_URL`
 - `QA_K6_URL`
 
-For frontend repos, the agent discovers likely user journeys from common route files such as `app/**/page.tsx`, `pages/**/*.tsx`, `src/pages/**/*.tsx`, and `src/routes/**/*.tsx`. It generates `tests/e2e/user-journeys.spec.ts` with one Playwright test per route and safe form-control interaction coverage. Dynamic routes use sample placeholders and can be overridden with the generated `QA_ROUTE_*` environment variables.
+For frontend repos, the agent discovers user journeys from:
+
+- File-based conventions: Next.js App Router (`app/**/page.tsx`), Next.js Pages Router, SvelteKit (`src/routes/**/+page.svelte`), Remix (`app/routes/**`), Astro (`src/pages/**.astro`), plain `src/pages/**` / `src/routes/**`.
+- JSX-declared routes: React Router (`<Route>`, `<PublicRoute>`, `<PrivateRoute>`, custom wrappers) — parsed by a stack-based, JSX-expression-balanced tokenizer that respects nested `<Route>` inheritance.
+- Config-declared routes: Vue Router (`{ path, component }` configs in `src/router/**`).
+- Optional live-crawl augmentation via `--crawl-url`.
+
+It generates `tests/e2e/user-journeys.spec.ts` with one Playwright test per route, plus `tests/a11y/qa-a11y.spec.ts` and `tests/visual/qa-visual.spec.ts` looping over the same route set. Per-page form fields and outbound API calls are detected and fed to the LLM as extra context, so the resulting assertions know about required-field validation and the API surface the page hits.
+
+For repos whose discovered routes look like a funnel (motor insurance, e-commerce checkout, multi-step onboarding), the agent additionally emits one or more `tests/helpers/<cluster>-walker.ts` files with a `walkTo(stageId)` helper that progresses through the cluster's stages. This saves the manual wiring usually needed to chain "form → confirmation → quotes → details → docs → summary → payment" tests.
+
+Dynamic routes use sample placeholders by default and can be overridden via:
+
+1. The generated `tests/fixtures/qa-uat.local.json` (gitignored, copied from the emitted `.example`).
+2. Per-route env vars: `QA_ROUTE_HOME`, `QA_ROUTE_<NAME>`, plus the global `QA_BASE_URL`.
+3. `qa-fixtures.json` at the target repo root for route-pattern overrides.
+
+## What the upgrade in v0.4 added (June 2026)
+
+- **User-story Excel → test generator** via the new `stories` subcommand. Reads `.xlsx` / `.csv` / `.tsv` / `.json`, auto-detects User Stories + APIs sheets, normalizes Jira/Linear/Notion/Azure-DevOps column variants, skips `Done`/`Closed` stories, cross-references the target repo's discovered routes + form fields, and emits one `describe()` per story (LLM-enriched when an API key is present, skeleton TODOs otherwise). API rows become a Postman v2.1 collection with status + JSON-shape assertions.
+- New modules `src/storiesImport.js`, `src/storiesToTests.js`, `src/storiesToPostman.js`.
+- `xlsx` added as a hard dependency.
+- 11 new tests added (86 → 97, all passing).
+
+## What the upgrade in v0.3 added (June 2026)
+
+- **Autonomous UAT walker** via the new `walk` subcommand. Given an entry URL (or `--urls` list), the agent drives a real Playwright/Chromium session through the flow: fills form fields from a fixture, clicks the highest-priority CTA, records every URL transition, and writes a per-URL trace JSON. With `--write-spec` it also generates a Playwright spec that reproduces the walk. Halts cleanly on OTP-without-bypass, captcha, no-CTA, or no-URL-change.
+- New module `src/walker.js` with pure-function helpers (`chooseCta`, `matchFieldsToFixture`, `isOtpGate`, `isCaptcha`, `buildSpecFromTrace`) so the decision logic stays testable without a real browser.
+- 9 new tests added (77 → 86, all passing). `playwright` added as a hard dependency.
+
+## What the upgrade in v0.2 added (June 2026)
+
+- **React Router JSX route discovery** with nested-route inheritance and JSX-expression-balanced attribute parsing. Closes the long-standing gap where CRA + React Router repos produced a single `/` journey.
+- **SvelteKit / Remix / Astro file-based scanners.**
+- **Vue Router config scanner.**
+- **Backend HTTP route scanner** (Express/Fastify/Koa) that flips `hasApi=true` and seeds Postman/k6 without needing an OpenAPI spec.
+- **Per-page form-field discovery** (MUI, plain HTML, React Hook Form).
+- **Frontend API-call discovery** (axios, fetch, helper-style clients) aggregated into the Postman/k6 endpoint list.
+- **Funnel clustering + walker autogen.** Routes that look like stages of a flow get a per-cluster `walkTo(stageId)` helper for free.
+- **Fixture autogen.** A gitignored `qa-uat.local.json.example` + `journey-fixture.ts` helper, emitted whenever discovered routes contain dynamic params, auth pages, or file uploads.
+- **Richer LLM prompts.** Form fields + API calls detected per page are appended to the per-route LLM prompt as additional context.
+
+Verified end-to-end against a CRA + React Router insurance app: agent went from generating 1 stub route (`/`) to discovering 98 real routes, annotating 20 with API calls and 6 with form fields, clustering into 2 funnel walkers, and emitting a fully-populated fixture stub.
