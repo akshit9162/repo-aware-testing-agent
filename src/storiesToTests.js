@@ -13,7 +13,8 @@
  * Discovery context is reused as-is — we feed the LLM the SAME journeys +
  * forms that `enrichJourneys` already builds.
  */
-import { storySlug, shouldSkipStory } from "./storiesImport.js";
+import { storySlug, shouldSkipStory, partitionByModule, groupTestCasesByStory } from "./storiesImport.js";
+import { pickSnapshotForRoute } from "./recorder.js";
 import crypto from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -337,4 +338,460 @@ function emptySpec(reason) {
 // ${reason}
 test.skip('user-stories.spec.ts has no stories yet', () => {});
 `;
+}
+
+// ---------- LLM enrichment for Test Cases (batched) ----------
+
+const TC_LLM_PROMPT = `You are a QA test designer. Given a set of user story test cases plus DOM-anchored application context, return a JSON array where each entry is one concrete Playwright test plan for the corresponding test case.
+
+Rules:
+- Return one entry per input test case. Preserve testCaseId exactly.
+- Each entry: { "testCaseId": "...", "testName": "...", "steps": [ ... ] }.
+- Steps use ONLY these shapes:
+  - { "kind": "goto", "path": "/route-path" }
+  - { "kind": "fill", "label": "Field Label", "value": "..." }
+  - { "kind": "click", "name": "Button or Link Label" }
+  - { "kind": "select", "label": "Field Label", "option": "..." }
+  - { "kind": "check", "label": "Checkbox Label" }
+  - { "kind": "expectUrl", "pattern": "regex fragment" }
+  - { "kind": "expectText", "text": "visible text substring" }
+  - { "kind": "expectVisible", "role": "heading|button|link|textbox|combobox", "name": "..." }
+
+DOM anchoring — this is the important part:
+- If a LIVE DOM SNAPSHOT is provided for a route, use ONLY labels/names/roles that appear in it. Do not invent. Do not fall back to Excel guesses when a snapshot exists.
+- If NO snapshot is provided for a route, prefer field labels + button labels from the discovered-routes context. Still don't invent.
+- Skip steps that can't be mapped to real elements (e.g. "review with team").
+- Testname: short, imperative sentence based on the test case summary.`;
+
+const TC_BATCH_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["results"],
+  properties: {
+    results: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["testCaseId", "steps"],
+        properties: {
+          testCaseId: { type: "string" },
+          testName: { type: "string" },
+          steps: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["kind"],
+              properties: {
+                kind: {
+                  enum: ["goto", "fill", "click", "select", "check", "expectUrl", "expectText", "expectVisible"],
+                },
+                path: { type: "string" },
+                label: { type: "string" },
+                value: { type: "string" },
+                name: { type: "string" },
+                option: { type: "string" },
+                pattern: { type: "string" },
+                text: { type: "string" },
+                role: { type: "string" },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
+function tcFingerprint(tc, story, journeys) {
+  const h = crypto.createHash("sha1");
+  h.update(JSON.stringify({
+    tcId: tc.testCaseId,
+    tcSummary: tc.summary,
+    tcSteps: tc.testSteps,
+    tcExpected: tc.expectedResult,
+    storyId: story?.id,
+    routes: journeys.map((j) => j.path).sort(),
+  }));
+  return h.digest("hex");
+}
+
+function formatSnapshotForPrompt(snap) {
+  if (!snap) return null;
+  const fields = (snap.fields || []).slice(0, 25).map((f) => {
+    const bits = [f.label || f.name || f.placeholder || "?"];
+    if (f.type) bits.push(`type=${f.type}`);
+    if (f.role) bits.push(`role=${f.role}`);
+    if (f.required) bits.push("required");
+    if (f.disabled) bits.push("disabled");
+    if (f.options?.length) bits.push(`options=${f.options.map((o) => o.label).slice(0, 6).join("|")}`);
+    return "  - " + bits.join(", ");
+  }).join("\n");
+  const buttons = (snap.buttons || []).slice(0, 20).map((b) => "  - " + b.label).join("\n");
+  const headings = (snap.headings || []).slice(0, 8).map((h) => "  - h" + h.level + ": " + h.text).join("\n");
+  return `URL: ${snap.url}
+Title: ${snap.title || ""}
+Headings:
+${headings || "  (none)"}
+Fields (real DOM):
+${fields || "  (none)"}
+Buttons (real DOM, visible only):
+${buttons || "  (none)"}`;
+}
+
+async function llmBatchEnrich({ client, provider, model, batch }) {
+  const context = batch.contextBlock;
+  const snapshotBlocks = (batch.snapshotsForBatch || [])
+    .map((entry) => `\n--- Snapshot for ${entry.hint} ---\n${entry.text}`)
+    .join("\n");
+  const userMessage = `Discovered routes from static repo scan:
+${context}
+${snapshotBlocks ? "\n\nLIVE DOM SNAPSHOTS (use these as ground truth for selectors):\n" + snapshotBlocks : ""}
+
+Test cases to convert (${batch.testCases.length}):
+
+${batch.testCases
+  .map((tc, i) => {
+    const story = batch.storyById.get(tc.storyId) || {};
+    return `--- Test Case ${i + 1} ---
+Test Case ID: ${tc.testCaseId}
+Linked Story ID: ${tc.storyId || "(none)"}
+Story Title: ${story.title || "(none)"}
+Page / Screen: ${tc.page || "(unspecified)"}
+Priority: ${tc.priority || "(unspecified)"}
+Prerequisites: ${(tc.prerequisites || "(none)").replace(/\r?\n/g, " ")}
+Test Steps:
+${(tc.testStepsArray || String(tc.testSteps || "").split(/\r?\n/)).filter(Boolean).map((s) => "  " + s.trim()).join("\n")}
+Test Data: ${(tc.testData || "(none)").replace(/\r?\n/g, " ")}
+Expected Result: ${(tc.expectedResult || "(none)").replace(/\r?\n/g, " ")}`;
+  })
+  .join("\n\n")}
+
+Return the JSON now, with one result per test case in the same order.`;
+
+  if (provider === "openai") {
+    const response = await client.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: TC_LLM_PROMPT },
+        { role: "user", content: userMessage },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "test_case_plans", strict: false, schema: TC_BATCH_SCHEMA },
+      },
+    });
+    const text = response.choices?.[0]?.message?.content;
+    return text ? JSON.parse(text)?.results || [] : [];
+  }
+  const response = await client.messages.create({
+    model,
+    // 8000 gives headroom for 6-batch outputs at ~1000 tokens each.
+    // Below 8000 we regularly hit "Unterminated string in JSON" on
+    // truncated responses; above adds latency without value.
+    max_tokens: 8000,
+    system: TC_LLM_PROMPT,
+    output_config: { format: { type: "json_schema", schema: TC_BATCH_SCHEMA } },
+    messages: [{ role: "user", content: userMessage }],
+  });
+  const text = response.content?.find?.((b) => b.type === "text")?.text;
+  return text ? JSON.parse(text)?.results || [] : [];
+}
+
+function buildEnrichedTestBlock(tc, plan) {
+  const testCaseId = tc.testCaseId || plan?.testCaseId || "TC";
+  const testName = (plan?.testName || tc.summary || "test").replace(/\r?\n/g, " ").slice(0, 140);
+  const steps = (plan?.steps || []).map((s) => stepToCode(s)).filter(Boolean);
+  return `  test(${JSON.stringify(`${testCaseId}: ${testName}`)}, async ({ page }) => {
+    // Page / Screen: ${tc.page || "(unspecified)"}
+    // Priority: ${tc.priority || "(unspecified)"}
+    ${tc.prerequisites ? `// Prerequisites: ${tc.prerequisites.replace(/\r?\n/g, " ")}` : ""}
+    // Expected: ${(tc.expectedResult || "").replace(/\r?\n/g, " ").slice(0, 240)}
+
+${steps.length ? steps.map((s) => "    " + s).join("\n") : "    // (LLM returned no runnable steps)\n    expect(true).toBeTruthy();"}
+  });`;
+}
+
+function buildStoryDescribeEnriched(story, testCases, enrichmentByTcId) {
+  const header = `${story.id ? story.id + " — " : ""}${story.title || "Untitled story"}`;
+  const summary = [
+    story.asA ? `As a ${story.asA}` : null,
+    story.want ? `I want ${story.want}` : null,
+    story.benefit ? `So that ${story.benefit}` : null,
+  ]
+    .filter(Boolean)
+    .join(" ") ||
+    (story.description || "").split(/\r?\n/)[0] ||
+    "";
+  const ac = String(story.ac || "").split(/\r?\n/).filter(Boolean);
+  const tests = testCases
+    .map((tc) => {
+      const plan = enrichmentByTcId.get(tc.testCaseId);
+      if (plan?.steps?.length) return buildEnrichedTestBlock(tc, plan);
+      return buildTestCaseSkeleton(story, tc, 0);
+    })
+    .join("\n\n");
+  return `test.describe(${JSON.stringify(header)}, () => {
+  // ${summary}
+  ${ac.length ? `//\n  // Acceptance Criteria:\n  //   ${ac.join("\n  //   ")}` : ""}
+
+${tests}
+});`;
+}
+
+function selectProviderForEnrich({ anthropicKey, openaiKey, override }) {
+  if (override) return override.toLowerCase();
+  if (process.env.QA_LLM_PROVIDER) return process.env.QA_LLM_PROVIDER.toLowerCase();
+  if (anthropicKey || process.env.ANTHROPIC_API_KEY) return "anthropic";
+  if (openaiKey || process.env.OPENAI_API_KEY) return "openai";
+  return null;
+}
+
+/**
+ * LLM-enrich a full workbook of test cases in batches. Returns per-module
+ * spec sources plus a stats block. Writes cache per-test-case fingerprint
+ * so partial or re-runs are cheap.
+ */
+export async function enrichSpecsFromTestCases({
+  stories = [],
+  testCases = [],
+  journeys = [],
+  snapshotsByUrl = new Map(), // NEW: DOM snapshots keyed by full URL from recorder
+  repoRoot,
+  batchSize = 8,
+  anthropicApiKey,
+  openaiApiKey,
+  providerOverride,
+  modelOverride,
+  logger = () => {},
+  onModuleComplete, // optional callback fired per module for incremental writes
+} = {}) {
+  if (!testCases.length) return { specsByModule: new Map(), stats: {} };
+  const provider = selectProviderForEnrich({
+    anthropicKey: anthropicApiKey,
+    openaiKey: openaiApiKey,
+    override: providerOverride,
+  });
+  if (!provider) throw new Error("enrichSpecsFromTestCases: no LLM provider (set ANTHROPIC_API_KEY or OPENAI_API_KEY).");
+  const model = modelOverride || process.env.QA_LLM_MODEL || (provider === "openai" ? "gpt-4o-mini" : "claude-sonnet-4-6");
+  const apiKey =
+    provider === "anthropic"
+      ? anthropicApiKey || process.env.ANTHROPIC_API_KEY
+      : openaiApiKey || process.env.OPENAI_API_KEY;
+  const client = await importClient(provider, apiKey);
+
+  const storyById = new Map(stories.filter((s) => s.id).map((s) => [String(s.id).trim(), s]));
+  const journeyIndex = journeys.slice(0, 40); // trim context to top routes
+  const contextBlock = journeyIndex
+    .map((j) => {
+      const forms = (j.forms || []).slice(0, 10).map((f) => f.label || f.name).filter(Boolean).join(", ");
+      return `- ${j.path}${forms ? "  fields: [" + forms + "]" : ""}`;
+    })
+    .join("\n") || "(no routes discovered)";
+
+  const partitions = partitionByModule(testCases, { fallback: "unassigned" });
+  const specsByModule = new Map();
+  const stats = { total: testCases.length, batches: 0, enriched: 0, cached: 0, failed: 0 };
+  const enrichmentByTcId = new Map();
+
+  for (const [moduleSlug, moduleCases] of partitions) {
+    const uncached = [];
+    for (const tc of moduleCases) {
+      if (!tc.testCaseId) continue;
+      const key = tcFingerprint(tc, storyById.get(tc.storyId) || {}, journeyIndex);
+      const cached = repoRoot ? await readCached(repoRoot, "tc-" + key) : null;
+      if (cached) {
+        enrichmentByTcId.set(tc.testCaseId, cached);
+        stats.cached += 1;
+      } else {
+        uncached.push({ tc, key });
+      }
+    }
+    // Batch the uncached
+    for (let i = 0; i < uncached.length; i += batchSize) {
+      const chunk = uncached.slice(i, i + batchSize);
+      // Attach the best-matching recorded snapshot for each test case's
+      // Page / Screen hint. Only include a snapshot once per batch even if
+      // multiple test cases target the same page (keeps prompt compact).
+      const snapshotsForBatch = [];
+      const seenSnapUrls = new Set();
+      if (snapshotsByUrl && snapshotsByUrl.size) {
+        for (const { tc } of chunk) {
+          const hints = [tc.page, tc.summary, tc.testSteps]
+            .filter(Boolean)
+            .map((s) => String(s).toLowerCase());
+          for (const hint of hints) {
+            const snap = pickSnapshotForRoute(hint, snapshotsByUrl);
+            if (snap && !seenSnapUrls.has(snap.url)) {
+              seenSnapUrls.add(snap.url);
+              const text = formatSnapshotForPrompt(snap);
+              if (text) snapshotsForBatch.push({ hint: snap.url, text });
+              break;
+            }
+          }
+        }
+      }
+      const batch = {
+        testCases: chunk.map((c) => c.tc),
+        storyById,
+        contextBlock,
+        snapshotsForBatch,
+      };
+      stats.batches += 1;
+      logger(`[${moduleSlug}] batch ${stats.batches} — ${chunk.length} test cases`);
+      try {
+        const results = await llmBatchEnrich({ client, provider, model, batch });
+        // Map results back by testCaseId. Fall back to positional order if
+        // the LLM re-orders or omits IDs.
+        for (let j = 0; j < chunk.length; j++) {
+          const tc = chunk[j].tc;
+          const key = chunk[j].key;
+          const plan =
+            results.find((r) => String(r.testCaseId).trim() === String(tc.testCaseId).trim()) ||
+            results[j] ||
+            null;
+          if (plan?.steps?.length) {
+            enrichmentByTcId.set(tc.testCaseId, plan);
+            stats.enriched += 1;
+            if (repoRoot) await writeCached(repoRoot, "tc-" + key, plan);
+          }
+        }
+      } catch (error) {
+        stats.failed += 1;
+        logger(`  batch ${stats.batches} failed: ${error?.message || String(error)}`);
+      }
+      // Small delay to respect rate limits.
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    // Build the module's spec now (enriched where we have plans, skeleton otherwise)
+    const moduleGroups = groupTestCasesByStory(moduleCases);
+    const blocks = [];
+    for (const [storyKey, cases] of moduleGroups) {
+      const story = storyById.get(storyKey) || {
+        id: storyKey === "__orphan__" ? null : storyKey,
+        title: storyKey === "__orphan__" ? "Orphan test cases (no linked story)" : `Story ${storyKey}`,
+      };
+      blocks.push(buildStoryDescribeEnriched(story, cases, enrichmentByTcId));
+    }
+    const spec = wrapSpec(blocks);
+    specsByModule.set(moduleSlug, spec);
+    if (typeof onModuleComplete === "function") {
+      try {
+        await onModuleComplete(moduleSlug, spec, { stats });
+      } catch {}
+    }
+  }
+
+  return { specsByModule, stats };
+}
+
+/**
+ * Emit one skeleton `test()` per test case, with the prescriptive steps
+ * + expected result as comments and a TODO body.
+ */
+function buildTestCaseSkeleton(story, tc, idx) {
+  const testCaseId = tc.testCaseId || `TC-${idx + 1}`;
+  const summary = (tc.summary || "test").replace(/\r?\n/g, " ").slice(0, 140);
+  const testName = `${testCaseId}: ${summary}`;
+  const steps = (tc.testStepsArray && tc.testStepsArray.length
+    ? tc.testStepsArray
+    : String(tc.testSteps || "").split(/\r?\n/).filter(Boolean)
+  ).map((s) => "    //   " + s.trim());
+  const expectedLines = String(tc.expectedResult || "")
+    .split(/\r?\n/)
+    .map((s) => "    //   " + s.trim())
+    .filter((l) => l.trim() !== "    //");
+  return `  test(${JSON.stringify(testName)}, async ({ page }) => {
+    // Page / Screen: ${tc.page || "(unspecified)"}
+    // Type: ${tc.testType || "(unspecified)"} | Priority: ${tc.priority || "(unspecified)"}
+    ${tc.prerequisites ? `//\n    // Prerequisites: ${tc.prerequisites.replace(/\r?\n/g, " ")}` : ""}
+    //
+    // Steps:
+${steps.length ? steps.join("\n") : "    //   (no steps provided)"}
+    //
+    // Expected:
+${expectedLines.length ? expectedLines.join("\n") : "    //   (none provided)"}
+    ${tc.testData ? `//\n    // Test Data: ${tc.testData.replace(/\r?\n/g, " ")}` : ""}
+
+    // TODO: implement per steps above.
+    expect(true).toBeTruthy();
+  });`;
+}
+
+function buildStoryDescribe(story, testCases) {
+  const header = `${story.id ? story.id + " — " : ""}${story.title || "Untitled story"}`;
+  const asA = story.asA ? `As a ${story.asA}` : null;
+  const want = story.want ? `I want ${story.want}` : null;
+  const benefit = story.benefit ? `So that ${story.benefit}` : null;
+  const summary = [asA, want, benefit].filter(Boolean).join(" ") || (story.description || "").split(/\r?\n/)[0] || "";
+  const ac = String(story.ac || "").split(/\r?\n/).filter(Boolean);
+  const tests = testCases.map((tc, i) => buildTestCaseSkeleton(story, tc, i)).join("\n\n");
+  return `test.describe(${JSON.stringify(header)}, () => {
+  // ${summary}
+  ${ac.length ? `//\n  // Acceptance Criteria:\n  //   ${ac.join("\n  //   ")}` : ""}
+
+${tests}
+});`;
+}
+
+/**
+ * Generate one or more spec files from stories + test cases, split by
+ * `Module / Sheet` column. Returns Map<moduleSlug, specSource>.
+ *
+ * Use this when the Excel has both a Stories sheet AND a Test Cases sheet
+ * with a `User Story ID` foreign key. Falls back to per-story skeletons
+ * when a story has no linked test cases.
+ */
+export function generateSpecsFromTestCases({
+  stories = [],
+  testCases = [],
+  journeys = [],
+} = {}) {
+  const storyById = new Map(
+    stories.filter((s) => s.id).map((s) => [String(s.id).trim(), s])
+  );
+  const byStory = groupTestCasesByStory(testCases);
+
+  // Assign each test case its Module → then split the whole workbook
+  // into per-module partitions of test cases.
+  const partitions = partitionByModule(testCases, { fallback: "unassigned" });
+  const specsByModule = new Map();
+
+  for (const [moduleSlug, moduleCases] of partitions) {
+    const moduleGroups = groupTestCasesByStory(moduleCases);
+    const blocks = [];
+    for (const [storyKey, cases] of moduleGroups) {
+      const story =
+        storyById.get(storyKey) ||
+        // Synthesize a minimal story record when the sheet references a
+        // story ID that isn't in the Stories sheet.
+        {
+          id: storyKey === "__orphan__" ? null : storyKey,
+          title: storyKey === "__orphan__" ? "Orphan test cases (no linked story)" : `Story ${storyKey}`,
+        };
+      blocks.push(buildStoryDescribe(story, cases));
+    }
+    specsByModule.set(moduleSlug, wrapSpec(blocks));
+  }
+  return specsByModule;
+}
+
+/**
+ * Aggregate stats across the multi-file emission — useful for the CLI
+ * summary.
+ */
+export function testCaseStats({ stories, testCases }) {
+  const storyIds = new Set(stories.map((s) => s.id).filter(Boolean));
+  const linked = testCases.filter((tc) => tc.storyId && storyIds.has(tc.storyId)).length;
+  const orphans = testCases.filter((tc) => !tc.storyId || !storyIds.has(tc.storyId)).length;
+  const modules = new Set(testCases.map((tc) => tc.module || tc.sourceFile).filter(Boolean));
+  return {
+    totalStories: stories.length,
+    totalTestCases: testCases.length,
+    linkedToStory: linked,
+    orphanTestCases: orphans,
+    modules: modules.size,
+  };
 }

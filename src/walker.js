@@ -43,10 +43,19 @@ const CAPTCHA_HINT_RE =
  * Lower index = higher priority. Ties broken by document order (first wins).
  * Returns the chosen button or null.
  */
+// Labels the walker should NEVER click as a primary CTA — they typically
+// send the user backwards or open a side-effect dialog. Matched
+// case-insensitively against the exact button label.
+const REGRESSIVE_LABEL_RE =
+  /^(back|cancel|close|skip|previous|modify|edit|edit details|change|reset|clear|logout|sign out)$/i;
+
 export function chooseCta(buttons, priorities = DEFAULT_CTA_PRIORITIES) {
   if (!buttons?.length) return null;
+  // Filter regressive buttons out entirely so they never win a tie.
+  const usable = buttons.filter((b) => !REGRESSIVE_LABEL_RE.test(String(b.label || "").trim()));
+  if (!usable.length) return null;
   const lowerPrios = priorities.map((p) => p.toLowerCase());
-  const ranked = buttons
+  const ranked = usable
     .map((btn, idx) => {
       const label = String(btn.label || "").trim().toLowerCase();
       const matchIdx = lowerPrios.findIndex((p) => label === p.toLowerCase() || label.includes(p.toLowerCase()));
@@ -55,12 +64,7 @@ export function chooseCta(buttons, priorities = DEFAULT_CTA_PRIORITIES) {
     .filter((entry) => entry.matchIdx >= 0)
     .sort((a, b) => (a.matchIdx - b.matchIdx) || (a.idx - b.idx));
   if (ranked.length) return ranked[0].btn;
-  // Fallback: first visible button whose label isn't "Back" or "Cancel"
-  const fallback = buttons.find((b) => {
-    const l = String(b.label || "").trim().toLowerCase();
-    return l && !/^(back|cancel|close|skip|previous)$/i.test(l);
-  });
-  return fallback || null;
+  return usable[0] || null;
 }
 
 /**
@@ -101,7 +105,16 @@ export function isOtpGate(snapshot) {
   const hasValidate = (snapshot.buttons || []).some(
     (b) => OTP_BUTTON_RE.test(b.label || "")
   );
-  return hasOtpInput && hasValidate;
+  if (!hasOtpInput || !hasValidate) return false;
+  // Guard against SPAs (Tameen, many MUI apps) that pre-render the OTP
+  // panel in the DOM but keep it hidden until the form is submitted.
+  // When a primary form CTA is *also* visible in the same snapshot, the
+  // form is active and this OTP detection is a false positive.
+  const hasFormCta = (snapshot.buttons || []).some((b) => {
+    const l = String(b.label || "").trim().toLowerCase();
+    return /^(proceed|continue|submit|next|buy now|confirm|save|pay)$/.test(l);
+  });
+  return !hasFormCta;
 }
 
 export function isCaptcha(snapshot) {
@@ -164,10 +177,27 @@ async function snapshotPage(page) {
   const data = await page.evaluate(() => {
     function visible(el) {
       if (!el) return false;
+      // Modern spec-compliant visibility check (Chromium 105+) — respects
+      // transforms, clip-path, visibility of ancestor chain, content-visibility.
+      // Catches MUI's transform-based panel hides that our old check missed.
+      if (typeof el.checkVisibility === "function") {
+        try {
+          return el.checkVisibility({
+            checkOpacity: true,
+            checkVisibilityCSS: true,
+            opacityProperty: true,
+            contentVisibilityAuto: true,
+          });
+        } catch {}
+      }
       const style = window.getComputedStyle(el);
       if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
       const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
+      if (rect.width === 0 || rect.height === 0) return false;
+      // Off-screen (translated / positioned out of viewport)
+      if (rect.right < 0 || rect.bottom < 0) return false;
+      if (rect.left > window.innerWidth || rect.top > window.innerHeight) return false;
+      return true;
     }
     function accName(el) {
       if (!el) return "";
@@ -197,6 +227,7 @@ async function snapshotPage(page) {
         placeholder: el.getAttribute("placeholder") || "",
         ariaLabel: el.getAttribute("aria-label") || "",
         type,
+        role: el.getAttribute("role") || "",
         disabled: el.disabled === true,
       });
     }
@@ -215,15 +246,25 @@ async function snapshotPage(page) {
 }
 
 async function fillField(page, field, value) {
+  // MUI Autocomplete + similar combobox widgets don't commit on `.fill()`
+  // alone — they need a keystroke. Detect via role="combobox" and press
+  // Enter after filling to accept the highlighted option.
+  const isCombobox =
+    /combobox/i.test(field.role || "") ||
+    String(field.type || "").toLowerCase() === "combobox";
   if (field.label) {
     try {
-      await page.getByLabel(field.label, { exact: false }).first().fill(String(value));
+      const locator = page.getByLabel(field.label, { exact: false }).first();
+      await locator.fill(String(value));
+      if (isCombobox) await locator.press("Enter").catch(() => {});
       return true;
     } catch {}
   }
   if (field.name) {
     try {
-      await page.locator(`[name="${field.name}"]`).first().fill(String(value));
+      const locator = page.locator(`[name="${field.name}"]`).first();
+      await locator.fill(String(value));
+      if (isCombobox) await locator.press("Enter").catch(() => {});
       return true;
     } catch {}
   }
@@ -254,6 +295,34 @@ async function waitForTransition(page, beforeUrl, timeoutMs = 30_000) {
     await page.waitForTimeout(250);
   }
   return { toUrl: page.url(), urlChanged: false, elapsedMs: Date.now() - started };
+}
+
+/**
+ * After a URL change, SPAs often show a loading spinner for several seconds
+ * before the real UI (buttons + form fields) renders. Snapshotting during
+ * that window sees an empty snapshot and the walker terminates with
+ * "no CTA found". Wait until the page has at least one visible interactive
+ * element (button or actionable field) OR the timeout expires.
+ */
+async function stabilizePage(page, timeoutMs = 25_000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const ready = await page.evaluate(() => {
+      function visible(el) {
+        if (!el) return false;
+        const s = window.getComputedStyle(el);
+        if (s.display === "none" || s.visibility === "hidden" || s.opacity === "0") return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      }
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter((el) => visible(el) && !el.disabled);
+      const inputs = Array.from(document.querySelectorAll("input, select, textarea")).filter((el) => visible(el) && !el.disabled);
+      const loading = /revving up|loading\.\.\.|please wait|hang tight/i.test((document.body?.innerText || "").slice(0, 2000));
+      return { hasInteractive: buttons.length > 0 || inputs.length > 0, loading };
+    }).catch(() => ({ hasInteractive: false, loading: false }));
+    if (ready.hasInteractive && !ready.loading) return;
+    await page.waitForTimeout(400);
+  }
 }
 
 /** Resolve `playwright` lazily so the rest of the agent's tooling doesn't fail when chromium isn't installed. */
@@ -301,6 +370,9 @@ export async function walkJourney({
     }
 
     await page.goto(entryUrl, { waitUntil: "domcontentloaded", timeout: navigationTimeoutMs });
+    // Injected/mock pages in tests don't have a real DOM to stabilize.
+    // Only wait for the SPA to settle when we launched a real browser.
+    if (!injectedPage) await stabilizePage(page).catch(() => {});
 
     for (let step = 0; step < maxSteps; step++) {
       trace.steps = step + 1;
@@ -357,6 +429,19 @@ export async function walkJourney({
       }
       stage.filledFields = filledFields;
 
+      // Fixture-driven pre-actions: click any visible element whose text
+      // matches one of these labels before the primary CTA. Use this for
+      // radio-like clickable divs (e.g. "Third Party Insurance" on Tameen)
+      // that aren't `<input type="radio">` and so aren't in field snapshots.
+      const preActionsFired = [];
+      for (const label of fixture?.preActions || []) {
+        try {
+          await page.getByText(label, { exact: false }).first().click({ timeout: 1500 });
+          preActionsFired.push(label);
+        } catch {}
+      }
+      if (preActionsFired.length) stage.preActionsFired = preActionsFired;
+
       const cta = chooseCta(snapshot.buttons, ctaPriorities);
       if (!cta) {
         stage.terminated = "no CTA found";
@@ -378,6 +463,10 @@ export async function walkJourney({
       }
 
       const transition = await waitForTransition(page, beforeUrl);
+      // If the URL changed, wait for the new page to render buttons/fields
+      // so the next iteration's snapshot doesn't miss them mid-load.
+      // Skip for injected/mock pages (tests).
+      if (transition.urlChanged && !injectedPage) await stabilizePage(page).catch(() => {});
       stage.transition = transition;
       trace.stages.push(stage);
 

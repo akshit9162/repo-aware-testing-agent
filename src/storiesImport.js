@@ -27,6 +27,17 @@ const STORY_SHEET_NAMES = [
 
 const API_SHEET_NAMES = ["apis", "api", "endpoints", "api spec", "api specs", "rest", "graphql"];
 
+const TEST_CASE_SHEET_NAMES = [
+  "test cases",
+  "test case",
+  "manual test cases",
+  "manual tests",
+  "test suite",
+  "tests",
+  "tc",
+  "test scenarios",
+];
+
 const STORY_ALIASES = {
   id: ["id", "story id", "us id", "ticket id", "jira id", "ref", "key", "issue id"],
   title: ["title", "summary", "story", "story title", "name", "headline"],
@@ -47,6 +58,23 @@ const STORY_ALIASES = {
   status: ["status", "state", "progress", "stage"],
   tags: ["tags", "labels", "epic", "feature", "components"],
   estimate: ["estimate", "points", "story points", "sp"],
+};
+
+const TEST_CASE_ALIASES = {
+  testCaseId: ["test case id", "tc id", "tc", "test id", "case id", "id"],
+  storyId: ["user story id", "story id", "us id", "linked story", "story", "parent id"],
+  page: ["page / screen", "page", "screen", "route", "path", "url"],
+  summary: ["test case summary", "summary", "test summary", "description", "title", "test title"],
+  priority: ["priority", "pri"],
+  prerequisites: ["prerequisites", "preconditions", "pre-conditions", "setup"],
+  testType: ["test type", "type", "category"],
+  suiteType: ["suite type", "suite", "test suite"],
+  testSteps: ["test steps", "steps", "actions", "procedure"],
+  testData: ["test data", "test data / condition", "data", "input"],
+  expectedResult: ["expected result", "expected", "expected outcome", "result", "then"],
+  module: ["module", "module / sheet", "component", "feature"],
+  status: ["status", "state"],
+  sourceFile: ["source file", "source"],
 };
 
 const API_ALIASES = {
@@ -112,6 +140,19 @@ export function normalizeStoryRow(raw) {
   return normalizeRow(raw, STORY_ALIASES);
 }
 
+export function normalizeTestCaseRow(raw) {
+  const norm = normalizeRow(raw, TEST_CASE_ALIASES);
+  // Split test steps into an array when they look like numbered/newline lists
+  if (norm.testSteps) {
+    const lines = norm.testSteps
+      .split(/\r?\n|(?=\s\d+\.\s)|(?<=\.)\s+(?=\d+\.\s)/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    norm.testStepsArray = lines;
+  }
+  return norm;
+}
+
 export function normalizeApiRow(raw) {
   const norm = normalizeRow(raw, API_ALIASES);
   if (norm.method) norm.method = norm.method.toUpperCase();
@@ -150,6 +191,7 @@ export function parseStoriesFile(filePath, options = {}) {
 
   // .xlsx / .xls
   const wb = readWorkbook(abs);
+  result.testCases = [];
   const storySheetName =
     (options.storySheet && wb.Sheets[options.storySheet] ? options.storySheet : null) ||
     findSheet(wb, STORY_SHEET_NAMES) ||
@@ -157,6 +199,9 @@ export function parseStoriesFile(filePath, options = {}) {
   const apiSheetName =
     (options.apisSheet && wb.Sheets[options.apisSheet] ? options.apisSheet : null) ||
     findSheet(wb, API_SHEET_NAMES);
+  const testCaseSheetName =
+    (options.testCasesSheet && wb.Sheets[options.testCasesSheet] ? options.testCasesSheet : null) ||
+    findSheet(wb, TEST_CASE_SHEET_NAMES);
 
   if (storySheetName) {
     const rows = sheetToRows(wb.Sheets[storySheetName]);
@@ -168,7 +213,47 @@ export function parseStoriesFile(filePath, options = {}) {
     result.apis = rows.filter((r) => !isEmptyRow(r)).map(normalizeApiRow);
     result.sheets.apis = apiSheetName;
   }
+  if (testCaseSheetName && testCaseSheetName !== apiSheetName) {
+    const rows = sheetToRows(wb.Sheets[testCaseSheetName]);
+    result.testCases = rows.filter((r) => !isEmptyRow(r)).map(normalizeTestCaseRow);
+    result.sheets.testCases = testCaseSheetName;
+  }
   return result;
+}
+
+/**
+ * Group test cases by their linked User Story ID. Test cases missing a
+ * story reference are grouped under a synthetic "orphan" key.
+ */
+export function groupTestCasesByStory(testCases) {
+  const groups = new Map();
+  for (const tc of testCases || []) {
+    const key = tc.storyId || "__orphan__";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(tc);
+  }
+  return groups;
+}
+
+/**
+ * Group test cases (or stories) by their Module / Source File hint —
+ * useful for splitting output into `tests/e2e/stories-<module>.spec.ts`
+ * files so a 1880-case suite doesn't land in a single unwieldy file.
+ */
+export function partitionByModule(entries, { fallback = "misc" } = {}) {
+  const partitions = new Map();
+  for (const entry of entries || []) {
+    const raw = entry.module || entry.sourceFile || fallback;
+    const slug = String(raw)
+      .toLowerCase()
+      .replace(/\.xlsx?$/i, "")
+      .replace(/[_ ]+user[_ ]?stories?[_ ]?and[_ ]?test[_ ]?cases?/i, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || fallback;
+    if (!partitions.has(slug)) partitions.set(slug, []);
+    partitions.get(slug).push(entry);
+  }
+  return partitions;
 }
 
 /**

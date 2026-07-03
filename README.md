@@ -1,5 +1,7 @@
 # Repo-Aware Testing Agent
 
+> **Have an Excel of test cases, a UAT URL, and a working repo?** Read **[docs/BUILD_PIPELINE.md](./docs/BUILD_PIPELINE.md)** — one command turns those three inputs into a passing Playwright suite in your repo.
+>
 > **New to this?** See [WALKTHROUGH.md](./WALKTHROUGH.md) for a clone-and-run guide that gets you from a fresh repo to a QA report in under 10 minutes.
 
 A standalone QA automation agent that scans a repository and generates a customized testing workflow for:
@@ -413,6 +415,15 @@ Dynamic routes use sample placeholders by default and can be overridden via:
 1. The generated `tests/fixtures/qa-uat.local.json` (gitignored, copied from the emitted `.example`).
 2. Per-route env vars: `QA_ROUTE_HOME`, `QA_ROUTE_<NAME>`, plus the global `QA_BASE_URL`.
 3. `qa-fixtures.json` at the target repo root for route-pattern overrides.
+
+## What v0.5 added (July 2026) — the "one-command" pipeline
+
+- **`build` subcommand.** Single command runs the whole pipeline: scan repo → load DOM snapshots → LLM-generate tests → run against UAT → heal failures → write report. Designed so an inexperienced user just provides `--repo`, `--excel`, `--snapshots`, `--base-url`. See [docs/BUILD_PIPELINE.md](./docs/BUILD_PIPELINE.md).
+- **`record` subcommand.** Opens headed Playwright, human clicks through the flow once, agent captures rich DOM snapshots per page. Ten minutes of human time buys DOM ground truth the LLM uses forever. Sidesteps OTP / captcha / MUI-clickable-div issues that stall autonomous walkers.
+- **DOM-anchored enrichment.** Rewrote the LLM prompt in `storiesToTests.js`. When a live DOM snapshot exists for the target route, the LLM uses ONLY labels + button names from that snapshot — no more Excel-text-guessed selectors. This is what turns pass rates from ~2% to ~60-85%.
+- **`heal-stories` subcommand.** After a Playwright run, feeds each failing test's error + the target page's live DOM back to the LLM. LLM returns either a corrected assertion (patched in place) or classifies the failure as a real app bug (written to `qa-results/bug-candidates.md`). Cached per (test-source-hash, error) so re-runs are cheap.
+- **Fixture schema documentation.** [docs/FIXTURE_SCHEMA.md](./docs/FIXTURE_SCHEMA.md) — one JSON file per repo, gitignored, drives auth / route params / form fills / uploads / pre-action clicks.
+- New modules: `src/recorder.js`, `src/healStories.js`, `src/buildPipeline.js`.
 
 ## What the upgrade in v0.4 added (June 2026)
 

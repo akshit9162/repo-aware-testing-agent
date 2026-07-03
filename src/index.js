@@ -14,8 +14,11 @@ export { extractFormFields, fieldsForJourney, annotateJourneysWithForms } from "
 export { extractApiCalls, callsForJourney, annotateJourneysWithApiCalls, aggregateApiCallsFromJourneys } from "./apiCallDiscovery.js";
 export { clusterJourneys, buildWalkerSpec, buildWalkerAssets } from "./journeyClustering.js";
 export { walkJourney, chooseCta, matchFieldsToFixture, isOtpGate, isCaptcha, buildSpecFromTrace, writeTrace } from "./walker.js";
-export { parseStoriesFile, normalizeStoryRow, normalizeApiRow, storySlug, shouldSkipStory } from "./storiesImport.js";
-export { generateStoryTests } from "./storiesToTests.js";
+export { recordJourney, loadRecordedSnapshots, pickSnapshotForRoute } from "./recorder.js";
+export { healFailingTests, extractFailures, extractTestSource, replaceTestBody } from "./healStories.js";
+export { buildPipeline } from "./buildPipeline.js";
+export { parseStoriesFile, normalizeStoryRow, normalizeApiRow, normalizeTestCaseRow, storySlug, shouldSkipStory, groupTestCasesByStory, partitionByModule } from "./storiesImport.js";
+export { generateStoryTests, generateSpecsFromTestCases, enrichSpecsFromTestCases, testCaseStats } from "./storiesToTests.js";
 export { apiToPostmanItem, apisToPostmanCollection } from "./storiesToPostman.js";
 export { discoverUnitTestTargets } from "./unitDiscovery.js";
 export { discoverApiEndpoints, cleanSource, parseExports, loadFixtures } from "./apiDiscovery.js";

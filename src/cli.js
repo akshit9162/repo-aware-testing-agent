@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, mergeJourneys, importHar, repair, bootstrapVisual, codingFix, codingFixInWorktree, buildRepoIndex, writeRepoIndex, queryRepoIndex, buildPatchBundle, renderPrMarkdown, walkJourney, writeTrace, buildSpecFromTrace, parseStoriesFile, generateStoryTests, apisToPostmanCollection } from "./index.js";
+import { scanRepository, detectStack, createTestPlan, generateAssets, applyAssets, discoverUserJourneys, enrichJourneys, crawlSite, mergeJourneys, importHar, repair, bootstrapVisual, codingFix, codingFixInWorktree, buildRepoIndex, writeRepoIndex, queryRepoIndex, buildPatchBundle, renderPrMarkdown, walkJourney, writeTrace, buildSpecFromTrace, parseStoriesFile, generateStoryTests, generateSpecsFromTestCases, enrichSpecsFromTestCases, testCaseStats, apisToPostmanCollection, recordJourney, loadRecordedSnapshots, healFailingTests, buildPipeline } from "./index.js";
 import { annotateJourneysWithForms } from "./formFieldDiscovery.js";
 import { loadDotenv } from "./loadEnv.js";
 import { writePlaywrightCoverageExcel } from "./playwrightExcel.js";
@@ -240,6 +240,63 @@ function parseHarArgs(argv) {
   return args;
 }
 
+function parseBuildArgs(argv) {
+  const args = {
+    repoPath: ".",
+    excel: null,
+    snapshotsPath: null,
+    baseUrl: null,
+    batchSize: 5,
+    healRounds: 1,
+    maxHeal: 200,
+  };
+  for (let i = 1; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--repo") { args.repoPath = argv[i + 1]; i += 1; }
+    else if (arg === "--excel") { args.excel = argv[i + 1]; i += 1; }
+    else if (arg === "--snapshots") { args.snapshotsPath = argv[i + 1]; i += 1; }
+    else if (arg === "--base-url") { args.baseUrl = argv[i + 1]; i += 1; }
+    else if (arg === "--batch-size") { args.batchSize = Number(argv[i + 1]); i += 1; }
+    else if (arg === "--heal-rounds") { args.healRounds = Number(argv[i + 1]); i += 1; }
+    else if (arg === "--max-heal") { args.maxHeal = Number(argv[i + 1]); i += 1; }
+  }
+  return args;
+}
+
+function parseHealArgs(argv) {
+  const args = {
+    input: argv[1] && !argv[1].startsWith("--") ? argv[1] : null,
+    repoPath: ".",
+    snapshotsPath: null,
+    max: 200,
+  };
+  for (let i = 1; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--repo") { args.repoPath = argv[i + 1]; i += 1; }
+    else if (arg === "--snapshots") { args.snapshotsPath = argv[i + 1]; i += 1; }
+    else if (arg === "--max") { args.max = Number(argv[i + 1]); i += 1; }
+  }
+  return args;
+}
+
+function parseRecordArgs(argv) {
+  const args = {
+    url: argv[1] && !argv[1].startsWith("--") ? argv[1] : null,
+    outPath: null,
+    repoPath: ".",
+    headless: false,
+    maxMinutes: 20,
+  };
+  for (let i = 1; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--out") { args.outPath = argv[i + 1]; i += 1; }
+    else if (arg === "--repo") { args.repoPath = argv[i + 1]; i += 1; }
+    else if (arg === "--headless") { args.headless = true; }
+    else if (arg === "--max-minutes") { args.maxMinutes = Number(argv[i + 1]); i += 1; }
+  }
+  return args;
+}
+
 function parseStoriesArgs(argv) {
   const args = {
     input: argv[1] && !argv[1].startsWith("--") ? argv[1] : null,
@@ -255,6 +312,10 @@ function parseStoriesArgs(argv) {
     if (arg === "--repo") { args.repoPath = argv[i + 1]; i += 1; }
     else if (arg === "--story-sheet") { args.storySheet = argv[i + 1]; i += 1; }
     else if (arg === "--apis-sheet") { args.apisSheet = argv[i + 1]; i += 1; }
+    else if (arg === "--test-cases-sheet") { args.testCasesSheet = argv[i + 1]; i += 1; }
+    else if (arg === "--enrich") { args.enrich = true; }
+    else if (arg === "--batch-size") { args.batchSize = Number(argv[i + 1]); i += 1; }
+    else if (arg === "--snapshots") { args.snapshotsPath = argv[i + 1]; i += 1; }
     else if (arg === "--out") { args.outPath = argv[i + 1]; i += 1; }
     else if (arg === "--postman-out") { args.postmanOut = argv[i + 1]; i += 1; }
     else if (arg === "--write") { args.write = true; }
@@ -473,6 +534,111 @@ async function main() {
     return;
   }
 
+  if (argv[0] === "build") {
+    const buildArgs = parseBuildArgs(argv);
+    if (!buildArgs.excel) {
+      throw new Error("Usage: repo-qa-agent build --repo <path> --excel <file.xlsx> [--snapshots <path-or-dir>] [--base-url <url>] [--heal-rounds N] [--batch-size N]");
+    }
+    const repoRoot = path.resolve(buildArgs.repoPath);
+    if (repoRoot !== path.resolve(process.cwd())) await loadDotenv(repoRoot);
+    const result = await buildPipeline({
+      repoRoot,
+      excelPath: path.resolve(buildArgs.excel),
+      snapshotsPath: buildArgs.snapshotsPath ? path.resolve(buildArgs.snapshotsPath) : null,
+      qaBaseUrl: buildArgs.baseUrl,
+      batchSize: buildArgs.batchSize || 5,
+      healRounds: buildArgs.healRounds || 1,
+      maxHeal: buildArgs.maxHeal || 200,
+      logger: (msg) => process.stderr.write(msg + "\n"),
+    });
+    console.log(JSON.stringify(
+      {
+        reportPath: result.reportPath,
+        runStats: result.runStats,
+        healStats: result.healStats,
+        enrichStats: result.enrichStats,
+        bugCandidatesPath: result.bugCandidatesPath,
+      },
+      null,
+      2
+    ));
+    return;
+  }
+
+  if (argv[0] === "heal-stories") {
+    const healArgs = parseHealArgs(argv);
+    if (!healArgs.input) {
+      throw new Error("Usage: repo-qa-agent heal-stories <playwright-results.json> [--repo <path>] [--snapshots <path-or-dir>] [--max N]");
+    }
+    const repoRoot = path.resolve(healArgs.repoPath);
+    if (repoRoot !== path.resolve(process.cwd())) await loadDotenv(repoRoot);
+
+    // Load DOM snapshots for grounding the LLM heal step
+    let snapshotsByUrl = new Map();
+    if (healArgs.snapshotsPath) {
+      const spec = path.resolve(healArgs.snapshotsPath);
+      let files = [];
+      try {
+        const stat = await fs.stat(spec);
+        if (stat.isDirectory()) {
+          const names = await fs.readdir(spec);
+          files = names.filter((n) => n.endsWith(".json")).map((n) => path.join(spec, n));
+        } else {
+          files = [spec];
+        }
+      } catch {}
+      snapshotsByUrl = loadRecordedSnapshots(files);
+      process.stderr.write(`[heal] loaded ${snapshotsByUrl.size} DOM snapshots\n`);
+    }
+
+    const resultsPath = path.resolve(healArgs.input);
+    const resultsJson = JSON.parse(await fs.readFile(resultsPath, "utf8"));
+    const result = await healFailingTests({
+      resultsJson,
+      repoRoot,
+      snapshotsByUrl,
+      anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+      openaiApiKey: process.env.OPENAI_API_KEY,
+      maxToHeal: healArgs.max || 200,
+      logger: (msg) => process.stderr.write("[heal] " + msg + "\n"),
+    });
+    console.log(JSON.stringify({ stats: result.stats, patchedCount: result.patched.length, bugCandidateCount: result.bugCandidates.length }, null, 2));
+    return;
+  }
+
+  if (argv[0] === "record") {
+    const recordArgs = parseRecordArgs(argv);
+    if (!recordArgs.url) {
+      throw new Error("Usage: repo-qa-agent record <entryUrl> [--out <path>] [--repo <path>] [--headless] [--max-minutes N]");
+    }
+    const repoRoot = path.resolve(recordArgs.repoPath);
+    const slug = recordArgs.url
+      .replace(/^https?:\/\//, "")
+      .replace(/[^a-zA-Z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    const outPath = recordArgs.outPath
+      ? path.resolve(repoRoot, recordArgs.outPath)
+      : path.resolve(repoRoot, "qa-snapshots", `${slug}.json`);
+    process.stderr.write(`[record] Opening browser to ${recordArgs.url}. Click through the flow.\n`);
+    process.stderr.write(`[record] Close the tab when done, OR wait ${recordArgs.maxMinutes || 20} min.\n`);
+    process.stderr.write(`[record] Force a snapshot from DevTools with: window.__snapshotNow()\n`);
+    const trace = await recordJourney({
+      entryUrl: recordArgs.url,
+      outPath,
+      headless: recordArgs.headless,
+      maxMinutes: recordArgs.maxMinutes,
+      logger: (msg) => process.stderr.write("[record] " + msg + "\n"),
+    });
+    console.log(JSON.stringify({
+      entryUrl: trace.entryUrl,
+      outPath,
+      stageCount: trace.stages.length,
+      urls: trace.stages.map((s) => s.url),
+      endReason: trace.endReason,
+    }, null, 2));
+    return;
+  }
+
   if (argv[0] === "stories") {
     const storyArgs = parseStoriesArgs(argv);
     if (!storyArgs.input) {
@@ -484,6 +650,7 @@ async function main() {
     const parsed = parseStoriesFile(path.resolve(storyArgs.input), {
       storySheet: storyArgs.storySheet,
       apisSheet: storyArgs.apisSheet,
+      testCasesSheet: storyArgs.testCasesSheet,
     });
 
     // Pull repo discovery so the LLM gets real route + form context.
@@ -496,14 +663,76 @@ async function main() {
       // Stories can be generated without a repo (e.g. pre-build planning).
     }
 
-    const { specSource, stats } = await generateStoryTests({
-      stories: parsed.stories,
-      journeys,
-      repoRoot,
-      anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-      openaiApiKey: process.env.OPENAI_API_KEY,
-      logger: (msg) => process.stderr.write("[stories] " + msg + "\n"),
-    });
+    // When the workbook has a Test Cases sheet with linked User Story IDs,
+    // emit one spec file per module with test-case-grained tests. Otherwise
+    // fall back to the older per-story LLM-enriched generator.
+    let specSource = null;
+    let stats = null;
+    let specByModule = null;
+    if ((parsed.testCases || []).length) {
+      if (storyArgs.enrich && (process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY)) {
+        // Load any recorded DOM snapshots the user provided so the LLM can
+        // ground selectors in real elements instead of Excel guesses.
+        let snapshotsByUrl = new Map();
+        if (storyArgs.snapshotsPath) {
+          const spec = path.resolve(storyArgs.snapshotsPath);
+          let snapshotFiles = [];
+          try {
+            const stat = await fs.stat(spec);
+            if (stat.isDirectory()) {
+              const names = await fs.readdir(spec);
+              snapshotFiles = names.filter((n) => n.endsWith(".json")).map((n) => path.join(spec, n));
+            } else {
+              snapshotFiles = [spec];
+            }
+          } catch {
+            process.stderr.write(`[stories] --snapshots path not found: ${spec}\n`);
+          }
+          snapshotsByUrl = loadRecordedSnapshots(snapshotFiles);
+          process.stderr.write(`[stories] loaded ${snapshotsByUrl.size} DOM snapshots from ${snapshotFiles.length} file(s)\n`);
+        }
+        process.stderr.write(`[stories] LLM-enriching ${parsed.testCases.length} test cases (batched, cached under .qa-agent-cache/llm-stories/)\n`);
+        const specsDir = path.resolve(repoRoot, "tests", "e2e");
+        await fs.mkdir(specsDir, { recursive: true });
+        const enrichResult = await enrichSpecsFromTestCases({
+          stories: parsed.stories,
+          testCases: parsed.testCases,
+          journeys,
+          snapshotsByUrl,
+          repoRoot,
+          batchSize: storyArgs.batchSize || 8,
+          anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+          openaiApiKey: process.env.OPENAI_API_KEY,
+          logger: (msg) => process.stderr.write("[stories] " + msg + "\n"),
+          onModuleComplete: storyArgs.write
+            ? async (moduleSlug, source) => {
+                await fs.writeFile(path.join(specsDir, `stories-${moduleSlug}.spec.ts`), source, "utf8");
+                process.stderr.write(`[stories] wrote stories-${moduleSlug}.spec.ts\n`);
+              }
+            : undefined,
+        });
+        specByModule = enrichResult.specsByModule;
+        stats = { ...testCaseStats({ stories: parsed.stories, testCases: parsed.testCases }), enrich: enrichResult.stats };
+      } else {
+        specByModule = generateSpecsFromTestCases({
+          stories: parsed.stories,
+          testCases: parsed.testCases,
+          journeys,
+        });
+        stats = testCaseStats({ stories: parsed.stories, testCases: parsed.testCases });
+      }
+    } else {
+      const result = await generateStoryTests({
+        stories: parsed.stories,
+        journeys,
+        repoRoot,
+        anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+        openaiApiKey: process.env.OPENAI_API_KEY,
+        logger: (msg) => process.stderr.write("[stories] " + msg + "\n"),
+      });
+      specSource = result.specSource;
+      stats = result.stats;
+    }
 
     const specPath = storyArgs.outPath
       ? path.resolve(repoRoot, storyArgs.outPath)
@@ -529,16 +758,39 @@ async function main() {
       mode: storyArgs.write ? "write" : "preview",
     };
 
+    if (specByModule) {
+      result.specFiles = [];
+      const specsDir = path.resolve(repoRoot, "tests", "e2e");
+      for (const [moduleSlug, source] of specByModule) {
+        const filePath = path.join(specsDir, `stories-${moduleSlug}.spec.ts`);
+        result.specFiles.push({ module: moduleSlug, path: filePath, bytes: source.length });
+      }
+      result.specFile = null;
+    }
+
     if (storyArgs.write) {
-      await fs.mkdir(path.dirname(specPath), { recursive: true });
-      await fs.writeFile(specPath, specSource, "utf8");
+      if (specByModule) {
+        const specsDir = path.resolve(repoRoot, "tests", "e2e");
+        await fs.mkdir(specsDir, { recursive: true });
+        for (const [moduleSlug, source] of specByModule) {
+          await fs.writeFile(path.join(specsDir, `stories-${moduleSlug}.spec.ts`), source, "utf8");
+        }
+      } else if (specSource) {
+        await fs.mkdir(path.dirname(specPath), { recursive: true });
+        await fs.writeFile(specPath, specSource, "utf8");
+      }
       if (postman) {
         await fs.mkdir(path.dirname(postmanPath), { recursive: true });
         await fs.writeFile(postmanPath, JSON.stringify(postman, null, 2) + "\n", "utf8");
       }
-    } else {
+    } else if (specSource) {
       result.preview = {
         spec: specSource.slice(0, 800) + (specSource.length > 800 ? "\n// ... (truncated; use --write to commit)" : ""),
+      };
+    } else if (specByModule) {
+      const first = specByModule.values().next().value || "";
+      result.preview = {
+        firstModuleSpec: first.slice(0, 800) + (first.length > 800 ? "\n// ... (truncated; use --write to commit)" : ""),
       };
     }
     console.log(JSON.stringify(result, null, 2));
