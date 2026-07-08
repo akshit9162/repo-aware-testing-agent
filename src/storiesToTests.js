@@ -342,26 +342,36 @@ test.skip('user-stories.spec.ts has no stories yet', () => {});
 
 // ---------- LLM enrichment for Test Cases (batched) ----------
 
-const TC_LLM_PROMPT = `You are a QA test designer. Given a set of user story test cases plus DOM-anchored application context, return a JSON array where each entry is one concrete Playwright test plan for the corresponding test case.
+const TC_LLM_PROMPT = `You are a QA test designer. Given user-story test cases and DOM-anchored application context, return a JSON array of Playwright test plans.
 
-Rules:
-- Return one entry per input test case. Preserve testCaseId exactly.
-- Each entry: { "testCaseId": "...", "testName": "...", "steps": [ ... ] }.
-- Steps use ONLY these shapes:
-  - { "kind": "goto", "path": "/route-path" }
-  - { "kind": "fill", "label": "Field Label", "value": "..." }
-  - { "kind": "click", "name": "Button or Link Label" }
-  - { "kind": "select", "label": "Field Label", "option": "..." }
-  - { "kind": "check", "label": "Checkbox Label" }
-  - { "kind": "expectUrl", "pattern": "regex fragment" }
-  - { "kind": "expectText", "text": "visible text substring" }
-  - { "kind": "expectVisible", "role": "heading|button|link|textbox|combobox", "name": "..." }
+STRICT ANTI-HALLUCINATION RULES — read these carefully.
 
-DOM anchoring — this is the important part:
-- If a LIVE DOM SNAPSHOT is provided for a route, use ONLY labels/names/roles that appear in it. Do not invent. Do not fall back to Excel guesses when a snapshot exists.
-- If NO snapshot is provided for a route, prefer field labels + button labels from the discovered-routes context. Still don't invent.
-- Skip steps that can't be mapped to real elements (e.g. "review with team").
-- Testname: short, imperative sentence based on the test case summary.`;
+The LIVE DOM SNAPSHOT below (when provided) is EXHAUSTIVE. If a field / button / heading is NOT in it, the element is NOT on the page. Do not assert it.
+
+The Excel columns (Steps, Expected Result) describe INTENT, not ground truth. The DOM is the ground truth. When they conflict:
+- DOM wins.
+- Never invent selectors from Excel wording ("New Vehicle checkbox", "BACK button") unless those exact elements exist in the snapshot's fields[] or buttons[].
+- If Excel mentions an element that is not in the DOM, either OMIT that step OR emit a step with kind:"expectText" using the visible text you can verify.
+
+For each test case return:
+{ "testCaseId": "...", "testName": "short imperative sentence", "steps": [ ... ] }
+
+Step shapes:
+  - { "kind": "goto",         "path": "/route-path" }
+  - { "kind": "fill",         "label": "Field Label from snapshot",  "value": "..." }
+  - { "kind": "click",        "name":  "Button label from snapshot" }
+  - { "kind": "select",       "label": "Field Label from snapshot",  "option": "..." }
+  - { "kind": "check",        "label": "Checkbox label from snapshot" }
+  - { "kind": "expectUrl",    "pattern": "regex fragment" }
+  - { "kind": "expectText",   "text": "visible text substring" }
+  - { "kind": "expectVisible","role": "heading|button|link|textbox|combobox", "name": "label from snapshot" }
+
+Constraints:
+- Preserve testCaseId exactly as given.
+- Every "label" / "name" MUST appear verbatim in the provided DOM snapshot fields[] or buttons[] when a snapshot exists.
+- No BACK / CANCEL / EDIT / LOGOUT assertions unless they exist in snapshot.buttons.
+- Prefer a small number of high-confidence steps (3-6) over a long list of guesses.
+- Skip un-mappable steps (e.g. "review with team", "verify audit trail in database").`;
 
 const TC_BATCH_SCHEMA = {
   type: "object",
@@ -404,7 +414,14 @@ const TC_BATCH_SCHEMA = {
   },
 };
 
-function tcFingerprint(tc, story, journeys) {
+// Bump when the prompt changes materially — invalidates cache so a re-run
+// with tightened rules doesn't silently reuse looser LLM output.
+const TC_PROMPT_VERSION = "v2-strict-anti-hallucination-2026-07-06";
+
+function tcFingerprint(tc, story, journeys, snapshotUrls = []) {
+  // Include snapshotUrls so runs WITH DOM snapshots get fresh LLM calls
+  // even when the same test case was cached from a snapshot-less run.
+  // Otherwise the DOM-anchored prompt improvement is silently ignored.
   const h = crypto.createHash("sha1");
   h.update(JSON.stringify({
     tcId: tc.testCaseId,
@@ -413,6 +430,8 @@ function tcFingerprint(tc, story, journeys) {
     tcExpected: tc.expectedResult,
     storyId: story?.id,
     routes: journeys.map((j) => j.path).sort(),
+    snapshotUrls: [...snapshotUrls].sort(),
+    promptVersion: TC_PROMPT_VERSION,
   }));
   return h.digest("hex");
 }
@@ -499,11 +518,23 @@ Return the JSON now, with one result per test case in the same order.`;
   return text ? JSON.parse(text)?.results || [] : [];
 }
 
-function buildEnrichedTestBlock(tc, plan) {
+function buildEnrichedTestBlock(tc, plan, seenTitles) {
   const testCaseId = tc.testCaseId || plan?.testCaseId || "TC";
   const testName = (plan?.testName || tc.summary || "test").replace(/\r?\n/g, " ").slice(0, 140);
+  let title = `${testCaseId}: ${testName}`;
+  // Playwright refuses duplicate titles within a spec file. Append a
+  // sequence suffix when we've seen this title before in the current file.
+  if (seenTitles) {
+    if (seenTitles.has(title)) {
+      const n = (seenTitles.get(title) || 1) + 1;
+      seenTitles.set(title, n);
+      title = `${title} #${n}`;
+    } else {
+      seenTitles.set(title, 1);
+    }
+  }
   const steps = (plan?.steps || []).map((s) => stepToCode(s)).filter(Boolean);
-  return `  test(${JSON.stringify(`${testCaseId}: ${testName}`)}, async ({ page }) => {
+  return `  test(${JSON.stringify(title)}, async ({ page }) => {
     // Page / Screen: ${tc.page || "(unspecified)"}
     // Priority: ${tc.priority || "(unspecified)"}
     ${tc.prerequisites ? `// Prerequisites: ${tc.prerequisites.replace(/\r?\n/g, " ")}` : ""}
@@ -513,7 +544,7 @@ ${steps.length ? steps.map((s) => "    " + s).join("\n") : "    // (LLM returned
   });`;
 }
 
-function buildStoryDescribeEnriched(story, testCases, enrichmentByTcId) {
+function buildStoryDescribeEnriched(story, testCases, enrichmentByTcId, seenTitles) {
   const header = `${story.id ? story.id + " — " : ""}${story.title || "Untitled story"}`;
   const summary = [
     story.asA ? `As a ${story.asA}` : null,
@@ -528,8 +559,8 @@ function buildStoryDescribeEnriched(story, testCases, enrichmentByTcId) {
   const tests = testCases
     .map((tc) => {
       const plan = enrichmentByTcId.get(tc.testCaseId);
-      if (plan?.steps?.length) return buildEnrichedTestBlock(tc, plan);
-      return buildTestCaseSkeleton(story, tc, 0);
+      if (plan?.steps?.length) return buildEnrichedTestBlock(tc, plan, seenTitles);
+      return buildTestCaseSkeleton(story, tc, 0, seenTitles);
     })
     .join("\n\n");
   return `test.describe(${JSON.stringify(header)}, () => {
@@ -599,7 +630,17 @@ export async function enrichSpecsFromTestCases({
     const uncached = [];
     for (const tc of moduleCases) {
       if (!tc.testCaseId) continue;
-      const key = tcFingerprint(tc, storyById.get(tc.storyId) || {}, journeyIndex);
+      // Compute per-test snapshot URLs used for grounding (empty when we
+      // have no snapshots) so the cache key invalidates when adding snapshots.
+      let snapUrls = [];
+      if (snapshotsByUrl && snapshotsByUrl.size) {
+        const hints = [tc.page, tc.summary, tc.testSteps].filter(Boolean).map((s) => String(s).toLowerCase());
+        for (const hint of hints) {
+          const snap = pickSnapshotForRoute(hint, snapshotsByUrl);
+          if (snap) { snapUrls.push(snap.url); break; }
+        }
+      }
+      const key = tcFingerprint(tc, storyById.get(tc.storyId) || {}, journeyIndex, snapUrls);
       const cached = repoRoot ? await readCached(repoRoot, "tc-" + key) : null;
       if (cached) {
         enrichmentByTcId.set(tc.testCaseId, cached);
@@ -668,12 +709,16 @@ export async function enrichSpecsFromTestCases({
     // Build the module's spec now (enriched where we have plans, skeleton otherwise)
     const moduleGroups = groupTestCasesByStory(moduleCases);
     const blocks = [];
+    // Per-file title tracker so Playwright's "no duplicate titles" rule
+    // is satisfied even when the same Test Case ID appears in multiple
+    // stories in the same module.
+    const seenTitlesPerFile = new Map();
     for (const [storyKey, cases] of moduleGroups) {
       const story = storyById.get(storyKey) || {
         id: storyKey === "__orphan__" ? null : storyKey,
         title: storyKey === "__orphan__" ? "Orphan test cases (no linked story)" : `Story ${storyKey}`,
       };
-      blocks.push(buildStoryDescribeEnriched(story, cases, enrichmentByTcId));
+      blocks.push(buildStoryDescribeEnriched(story, cases, enrichmentByTcId, seenTitlesPerFile));
     }
     const spec = wrapSpec(blocks);
     specsByModule.set(moduleSlug, spec);
@@ -691,10 +736,19 @@ export async function enrichSpecsFromTestCases({
  * Emit one skeleton `test()` per test case, with the prescriptive steps
  * + expected result as comments and a TODO body.
  */
-function buildTestCaseSkeleton(story, tc, idx) {
+function buildTestCaseSkeleton(story, tc, idx, seenTitles) {
   const testCaseId = tc.testCaseId || `TC-${idx + 1}`;
   const summary = (tc.summary || "test").replace(/\r?\n/g, " ").slice(0, 140);
-  const testName = `${testCaseId}: ${summary}`;
+  let testName = `${testCaseId}: ${summary}`;
+  if (seenTitles) {
+    if (seenTitles.has(testName)) {
+      const n = (seenTitles.get(testName) || 1) + 1;
+      seenTitles.set(testName, n);
+      testName = `${testName} #${n}`;
+    } else {
+      seenTitles.set(testName, 1);
+    }
+  }
   const steps = (tc.testStepsArray && tc.testStepsArray.length
     ? tc.testStepsArray
     : String(tc.testSteps || "").split(/\r?\n/).filter(Boolean)
